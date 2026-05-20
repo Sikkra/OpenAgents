@@ -21,7 +21,6 @@ interface IERC20 {
 contract Router {
     address public admin;
 
-    // pool registry: tokenA => tokenB => pool address
     mapping(address => mapping(address => address)) public pools;
 
     event PoolRegistered(address tokenA, address tokenB, address pool);
@@ -38,40 +37,43 @@ contract Router {
         emit PoolRegistered(_tokenA, _tokenB, _pool);
     }
 
-    // BUG: No slippage protection — minAmountOut is passed as 0 to every intermediate hop,
-    // so a sandwich attacker can extract maximum value from multi-hop trades
-    // BUG: Path validation missing — no check that path[0] != path[path.length-1],
-    // allowing circular swaps (A->B->A) that waste gas and may be used in attacks
-    // BUG: Intermediate amounts not validated — if a pool returns 0 from swap,
-    // subsequent hops proceed with 0 input, silently producing a 0-output trade
     function swapMultiHop(
         address[] calldata path,
         uint256 amountIn,
-        uint256 /* minAmountOut */
+        uint256 minAmountOut
     ) external returns (uint256 amountOut) {
         require(path.length >= 2, "Path too short");
+        require(amountIn > 0, "Zero input");
+        require(minAmountOut > 0, "Zero min output");
+        _validatePath(path);
 
-        IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn);
+        uint256[] memory quotedAmounts = _quotePath(path, amountIn);
+        uint256 expectedFinalAmount = quotedAmounts[path.length - 1];
+        require(expectedFinalAmount >= minAmountOut, "Quote below min output");
+
+        require(IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn), "Transfer in failed");
 
         uint256 currentAmount = amountIn;
+        uint256 finalHopIndex = path.length - 2;
 
         for (uint256 i = 0; i < path.length - 1; i++) {
             address tokenIn = path[i];
-            address tokenOut = path[i + 1];
-
-            address pool = pools[tokenIn][tokenOut];
+            address pool = pools[tokenIn][path[i + 1]];
             require(pool != address(0), "No pool for pair");
 
-            IERC20(tokenIn).approve(pool, currentAmount);
-
-            // Passes 0 as minAmountOut — no slippage protection on intermediate hops
-            currentAmount = IAMMPool(pool).swap(tokenIn, currentAmount, 0);
+            currentAmount = _swapHop(
+                pool,
+                tokenIn,
+                currentAmount,
+                i == finalHopIndex
+                    ? minAmountOut
+                    : _hopMinAmountOut(quotedAmounts[i + 1], expectedFinalAmount, minAmountOut)
+            );
         }
 
         amountOut = currentAmount;
-
-        // Transfer final tokens to user
-        IERC20(path[path.length - 1]).transfer(msg.sender, amountOut);
+        require(amountOut >= minAmountOut, "Slippage exceeded");
+        require(IERC20(path[path.length - 1]).transfer(msg.sender, amountOut), "Transfer out failed");
 
         emit MultiHopSwap(msg.sender, path, amountIn, amountOut);
     }
@@ -80,24 +82,68 @@ contract Router {
         address[] calldata path,
         uint256 amountIn
     ) external view returns (uint256 estimatedOut) {
-        uint256 currentAmount = amountIn;
+        return _quotePath(path, amountIn)[path.length - 1];
+    }
+
+    function getPool(address tokenA, address tokenB) external view returns (address) {
+        return pools[tokenA][tokenB];
+    }
+
+    function _validatePath(address[] calldata path) internal pure {
+        for (uint256 i = 0; i < path.length; i++) {
+            require(path[i] != address(0), "Zero path token");
+            for (uint256 j = i + 1; j < path.length; j++) {
+                require(path[i] != path[j], "Circular path");
+            }
+        }
+    }
+
+    function _quotePath(
+        address[] calldata path,
+        uint256 amountIn
+    ) internal view returns (uint256[] memory amounts) {
+        require(path.length >= 2, "Path too short");
+        amounts = new uint256[](path.length);
+        amounts[0] = amountIn;
 
         for (uint256 i = 0; i < path.length - 1; i++) {
             address pool = pools[path[i]][path[i + 1]];
             require(pool != address(0), "No pool");
 
-            (uint256 resA, uint256 resB) = IAMMPool(pool).getReserves();
-            address tA = IAMMPool(pool).tokenA();
-
-            (uint256 resIn, uint256 resOut) = (path[i] == tA) ? (resA, resB) : (resB, resA);
-            uint256 amountInWithFee = currentAmount * 9970;
-            currentAmount = (amountInWithFee * resOut) / (resIn * 10000 + amountInWithFee);
+            amounts[i + 1] = _getAmountOut(pool, path[i], amounts[i]);
+            require(amounts[i + 1] > 0, "Zero quote output");
         }
-
-        return currentAmount;
     }
 
-    function getPool(address tokenA, address tokenB) external view returns (address) {
-        return pools[tokenA][tokenB];
+    function _getAmountOut(
+        address pool,
+        address tokenIn,
+        uint256 amountIn
+    ) internal view returns (uint256) {
+        (uint256 resA, uint256 resB) = IAMMPool(pool).getReserves();
+        address tA = IAMMPool(pool).tokenA();
+        (uint256 resIn, uint256 resOut) = tokenIn == tA ? (resA, resB) : (resB, resA);
+        uint256 amountInWithFee = amountIn * 9970;
+        return (amountInWithFee * resOut) / (resIn * 10000 + amountInWithFee);
+    }
+
+    function _hopMinAmountOut(
+        uint256 quotedHopAmount,
+        uint256 expectedFinalAmount,
+        uint256 finalMinAmountOut
+    ) internal pure returns (uint256) {
+        uint256 hopMinAmountOut = (quotedHopAmount * finalMinAmountOut) / expectedFinalAmount;
+        return hopMinAmountOut == 0 ? 1 : hopMinAmountOut;
+    }
+
+    function _swapHop(
+        address pool,
+        address tokenIn,
+        uint256 amountIn,
+        uint256 minAmountOut
+    ) internal returns (uint256 amountOut) {
+        require(IERC20(tokenIn).approve(pool, amountIn), "Approve failed");
+        amountOut = IAMMPool(pool).swap(tokenIn, amountIn, minAmountOut);
+        require(amountOut > 0, "Zero hop output");
     }
 }
