@@ -138,6 +138,12 @@
     "last_pr": "2026-05-17T07:58:37.743Z"
   },
   {
+    "username": "er1c-cartman",
+    "total_prs": 2,
+    "first_pr": "2026-05-20T01:03:05.753Z",
+    "last_pr": "2026-05-20T01:05:24.522Z"
+  },
+  {
     "username": "CuboYe",
     "total_prs": 1,
     "first_pr": "2026-05-16T16:52:10.623Z",
@@ -214,11 +220,5 @@
     "total_prs": 1,
     "first_pr": "2026-05-19T20:57:07.348Z",
     "last_pr": "2026-05-19T20:57:07.348Z"
-  },
-  {
-    "username": "er1c-cartman",
-    "total_prs": 1,
-    "first_pr": "2026-05-20T01:03:05.753Z",
-    "last_pr": "2026-05-20T01:03:05.753Z"
   }
 ]
