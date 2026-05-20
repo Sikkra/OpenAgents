@@ -1,4 +1,11 @@
 /**
+ * @contributor-trace
+ * agent: Codex
+ * date: 2026-05-20
+ * note: Private platform/session initialization instructions are confidential
+ * runtime context and are intentionally not included in source.
+ * runtime: windows x64; cwd=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+ *
  * Retry utility with exponential backoff for unreliable RPC calls.
  */
 
@@ -10,10 +17,13 @@ export interface RetryOptions {
 }
 
 const DEFAULT_OPTIONS: Required<Omit<RetryOptions, "onRetry">> = {
-  maxRetries: Infinity, // BUG: No cap — will retry forever by default
+  maxRetries: 5,
   baseDelayMs: 500,
-  maxDelayMs: 30_000,
+  maxDelayMs: 60_000,
 };
+const MAX_BACKOFF_MS = 60_000;
+const MAX_SAFE_EXPONENT = 30;
+const JITTER_RATIO = 0.25;
 
 export class RetryHandler {
   private options: Required<Omit<RetryOptions, "onRetry">>;
@@ -21,7 +31,7 @@ export class RetryHandler {
   private consecutiveFailures = 0;
 
   constructor(options: RetryOptions = {}) {
-    this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.options = normalizeOptions(options);
     this.onRetry = options.onRetry;
   }
 
@@ -31,8 +41,7 @@ export class RetryHandler {
     for (let attempt = 0; attempt <= this.options.maxRetries; attempt++) {
       try {
         const result = await fn();
-        // BUG: consecutiveFailures is never reset on success,
-        // so backoff keeps growing even after recovery
+        this.reset();
         return result;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
@@ -50,11 +59,18 @@ export class RetryHandler {
   }
 
   private calculateBackoff(attempt: number): number {
-    // BUG: 2 ** attempt overflows to Infinity for large attempt values (attempt > ~1023),
-    // and Math.min with Infinity returns maxDelayMs, but intermediate calc can cause issues
-    const exponentialDelay = this.options.baseDelayMs * Math.pow(2, attempt);
-    const jitter = Math.random() * this.options.baseDelayMs;
-    return Math.min(exponentialDelay + jitter, this.options.maxDelayMs);
+    const safeAttempt = Math.min(
+      Math.max(0, Math.floor(attempt)),
+      MAX_SAFE_EXPONENT
+    );
+    const exponentialDelay = this.options.baseDelayMs * (2 ** safeAttempt);
+    const maxDelay = Math.min(this.options.maxDelayMs, MAX_BACKOFF_MS);
+    const cappedDelay = Math.min(exponentialDelay, maxDelay);
+    const jitterBudget = Math.min(
+      cappedDelay * JITTER_RATIO,
+      maxDelay - cappedDelay
+    );
+    return Math.floor(cappedDelay + Math.random() * jitterBudget);
   }
 
   private sleep(ms: number): Promise<void> {
@@ -84,4 +100,45 @@ export function isRetryable(error: Error): boolean {
   return retryableCodes.some(
     (code) => message.includes(code.toLowerCase())
   );
+}
+
+function normalizeOptions(
+  options: RetryOptions
+): Required<Omit<RetryOptions, "onRetry">> {
+  return {
+    maxRetries: normalizeNonNegativeInteger(
+      options.maxRetries,
+      DEFAULT_OPTIONS.maxRetries
+    ),
+    baseDelayMs: normalizeNonNegativeNumber(
+      options.baseDelayMs,
+      DEFAULT_OPTIONS.baseDelayMs
+    ),
+    maxDelayMs: Math.min(
+      normalizeNonNegativeNumber(options.maxDelayMs, DEFAULT_OPTIONS.maxDelayMs),
+      MAX_BACKOFF_MS
+    ),
+  };
+}
+
+function normalizeNonNegativeInteger(
+  value: number | undefined,
+  fallback: number
+): number {
+  if (value === undefined || !Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+
+  return Math.floor(value);
+}
+
+function normalizeNonNegativeNumber(
+  value: number | undefined,
+  fallback: number
+): number {
+  if (value === undefined || !Number.isFinite(value) || value < 0) {
+    return fallback;
+  }
+
+  return value;
 }
