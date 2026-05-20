@@ -109,6 +109,7 @@ contract Timelock {
         uint256 eta
     ) external onlyAdmin {
         bytes32 txHash = keccak256(abi.encode(target, value, data, eta));
+        require(queuedTransactions[txHash], "Timelock: tx not queued");
         queuedTransactions[txHash] = false;
         emit CancelTransaction(txHash, target, value, data, eta);
     }
