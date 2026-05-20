@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: MIT
+// @contributor openai-codex-wallet-42
+// @platform Private platform/session initialization text intentionally omitted.
+// @env os=windows; arch=x64; home_dir=C:\Users\Ben; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+// @timestamp 2026-05-20T08:05:12Z
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -21,8 +25,16 @@ contract StakingRewards is ReentrancyGuard {
     uint256 public lastUpdateTime;
     uint256 public rewardPerTokenStored;
 
+    uint256 public constant BOOST_PRECISION = 10_000;
+    uint256 public constant BOOST_BASE = 10_000;
+    uint256 public constant BOOST_ONE_AND_HALF = 15_000;
+    uint256 public constant BOOST_DOUBLE = 20_000;
+    uint256 public constant BOOST_TIER_ONE = 30 days;
+    uint256 public constant BOOST_TIER_TWO = 90 days;
+
     mapping(address => uint256) public userRewardPerTokenPaid;
     mapping(address => uint256) public rewards;
+    mapping(address => uint256) public stakeTimestamps;
 
     uint256 private _totalSupply;
     mapping(address => uint256) private _balances;
@@ -76,16 +88,35 @@ contract StakingRewards is ReentrancyGuard {
 
     /// @notice Calculate total earned rewards for an account.
     function earned(address account) public view returns (uint256) {
-        return (_balances[account] * (rewardPerToken() - userRewardPerTokenPaid[account])) / 1e18
-            + rewards[account];
+        uint256 newBaseReward = (_balances[account] * (rewardPerToken() - userRewardPerTokenPaid[account])) / 1e18;
+        return rewards[account] + _boostReward(account, newBaseReward);
+    }
+
+    /// @notice Return the staking reward multiplier for an account, scaled by BOOST_PRECISION.
+    function getRewardMultiplier(address account) public view returns (uint256) {
+        uint256 timestamp = stakeTimestamps[account];
+        if (_balances[account] == 0 || timestamp == 0) {
+            return BOOST_BASE;
+        }
+
+        uint256 stakeAge = block.timestamp - timestamp;
+        if (stakeAge >= BOOST_TIER_TWO) {
+            return BOOST_DOUBLE;
+        }
+        if (stakeAge >= BOOST_TIER_ONE) {
+            return BOOST_ONE_AND_HALF;
+        }
+        return BOOST_BASE;
     }
 
     /// @notice Stake tokens to earn rewards.
     /// @param amount Amount of staking token to deposit.
     function stake(uint256 amount) external nonReentrant updateReward(msg.sender) {
         require(amount > 0, "Cannot stake 0");
+        uint256 previousBalance = _balances[msg.sender];
         _totalSupply += amount;
-        _balances[msg.sender] += amount;
+        _balances[msg.sender] = previousBalance + amount;
+        stakeTimestamps[msg.sender] = _combinedStakeTimestamp(previousBalance, amount, stakeTimestamps[msg.sender]);
         stakingToken.safeTransferFrom(msg.sender, address(this), amount);
         emit Staked(msg.sender, amount);
     }
@@ -96,6 +127,9 @@ contract StakingRewards is ReentrancyGuard {
         require(amount > 0, "Cannot withdraw 0");
         _totalSupply -= amount;
         _balances[msg.sender] -= amount;
+        if (_balances[msg.sender] == 0) {
+            stakeTimestamps[msg.sender] = 0;
+        }
         stakingToken.safeTransfer(msg.sender, amount);
         emit Withdrawn(msg.sender, amount);
     }
@@ -129,5 +163,22 @@ contract StakingRewards is ReentrancyGuard {
         lastUpdateTime = block.timestamp;
         periodFinish = block.timestamp + rewardsDuration;
         emit RewardAdded(reward);
+    }
+
+    function _boostReward(address account, uint256 reward) internal view returns (uint256) {
+        return (reward * getRewardMultiplier(account)) / BOOST_PRECISION;
+    }
+
+    function _combinedStakeTimestamp(
+        uint256 previousBalance,
+        uint256 addedAmount,
+        uint256 previousTimestamp
+    ) internal view returns (uint256) {
+        if (previousBalance == 0 || previousTimestamp == 0) {
+            return block.timestamp;
+        }
+
+        return ((previousTimestamp * previousBalance) + (block.timestamp * addedAmount))
+            / (previousBalance + addedAmount);
     }
 }
