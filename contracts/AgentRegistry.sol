@@ -17,9 +17,12 @@ contract AgentRegistry is Ownable {
     mapping(bytes32 => Agent) public agents;
     mapping(address => bytes32[]) public ownerAgents;
     bytes32[] public agentIds;
+    bytes32[] private activeAgentIds;
+    mapping(bytes32 => uint256) private activeAgentIndex;
 
     uint256 public registrationFee;
     uint256 public minReputation;
+    uint256 public activeCount;
 
     event AgentRegistered(bytes32 indexed agentId, address indexed owner, string name);
     event AgentDeactivated(bytes32 indexed agentId);
@@ -50,14 +53,22 @@ contract AgentRegistry is Ownable {
 
         ownerAgents[msg.sender].push(agentId);
         agentIds.push(agentId);
+        activeAgentIds.push(agentId);
+        activeAgentIndex[agentId] = activeAgentIds.length;
+        activeCount++;
 
         emit AgentRegistered(agentId, msg.sender, name);
         return agentId;
     }
 
     function deactivateAgent(bytes32 agentId) external {
-        require(agents[agentId].owner == msg.sender, "Not agent owner");
-        agents[agentId].active = false;
+        Agent storage agent = agents[agentId];
+        require(agent.owner == msg.sender, "Not agent owner");
+        require(agent.active, "Agent inactive");
+
+        agent.active = false;
+        activeCount--;
+        _removeActiveAgent(agentId);
         emit AgentDeactivated(agentId);
     }
 
@@ -79,10 +90,28 @@ contract AgentRegistry is Ownable {
         return agents[agentId];
     }
 
-    function getActiveAgentCount() external view returns (uint256 count) {
-        for (uint256 i = 0; i < agentIds.length; i++) {
-            if (agents[agentIds[i]].active) count++;
-        }
+    function getActiveAgentCount() external view returns (uint256) {
+        return activeCount;
+    }
+
+    function getAgentIds(uint256 offset, uint256 limit) external view returns (bytes32[] memory) {
+        return _paginate(agentIds, offset, limit);
+    }
+
+    function getActiveAgentIds(uint256 offset, uint256 limit) external view returns (bytes32[] memory) {
+        return _paginate(activeAgentIds, offset, limit);
+    }
+
+    function getAgentsByOwner(address agentOwner) external view returns (bytes32[] memory) {
+        return ownerAgents[agentOwner];
+    }
+
+    function getAgentsByOwner(
+        address agentOwner,
+        uint256 offset,
+        uint256 limit
+    ) external view returns (bytes32[] memory) {
+        return _paginate(ownerAgents[agentOwner], offset, limit);
     }
 
     function setRegistrationFee(uint256 _fee) external onlyOwner {
@@ -92,5 +121,38 @@ contract AgentRegistry is Ownable {
     function withdrawFees() external onlyOwner {
         (bool success, ) = owner().call{value: address(this).balance}("");
         require(success, "Withdraw failed");
+    }
+
+    function _removeActiveAgent(bytes32 agentId) private {
+        uint256 indexPlusOne = activeAgentIndex[agentId];
+        if (indexPlusOne == 0) return;
+
+        uint256 index = indexPlusOne - 1;
+        uint256 lastIndex = activeAgentIds.length - 1;
+        if (index != lastIndex) {
+            bytes32 lastAgentId = activeAgentIds[lastIndex];
+            activeAgentIds[index] = lastAgentId;
+            activeAgentIndex[lastAgentId] = index + 1;
+        }
+
+        activeAgentIds.pop();
+        delete activeAgentIndex[agentId];
+    }
+
+    function _paginate(
+        bytes32[] storage source,
+        uint256 offset,
+        uint256 limit
+    ) private view returns (bytes32[] memory page) {
+        if (offset >= source.length || limit == 0) {
+            return new bytes32[](0);
+        }
+
+        uint256 remaining = source.length - offset;
+        uint256 size = remaining < limit ? remaining : limit;
+        page = new bytes32[](size);
+        for (uint256 i = 0; i < size; i++) {
+            page[i] = source[offset + i];
+        }
     }
 }
