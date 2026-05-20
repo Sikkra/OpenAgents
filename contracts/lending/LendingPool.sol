@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: MIT
+// @contributor openai-codex-wallet-142
+// @platform Private platform/session initialization text intentionally omitted.
+// @runtime os=windows; arch=x64; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+// @date 2026-05-20T08:28:50Z
 pragma solidity ^0.8.20;
+
+import "../utils/Permit2Transfer.sol";
 
 interface IPriceFeed {
     function getPrice(address token) external view returns (uint256);
@@ -53,6 +59,28 @@ contract LendingPool {
         emit Deposited(msg.sender, amount);
     }
 
+    /// @notice Deposit collateral using a Permit2 signature instead of a prior ERC20 approval.
+    function depositWithPermit2(
+        uint256 amount,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        require(amount > 0, "Zero amount");
+        Permit2Transfer.permitTransferFrom(
+            address(collateralToken),
+            msg.sender,
+            address(this),
+            amount,
+            nonce,
+            deadline,
+            signature
+        );
+        positions[msg.sender].collateralAmount += amount;
+        totalDeposits += amount;
+        emit Deposited(msg.sender, amount);
+    }
+
     function borrow(uint256 amount) external {
         require(amount > 0, "Zero amount");
         positions[msg.sender].borrowedAmount += amount;
@@ -72,6 +100,29 @@ contract LendingPool {
         emit Repaid(msg.sender, amount);
     }
 
+    /// @notice Repay debt using a Permit2 signature instead of a prior ERC20 approval.
+    function repayWithPermit2(
+        uint256 amount,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        Position storage pos = positions[msg.sender];
+        require(amount <= pos.borrowedAmount, "Repay exceeds debt");
+        Permit2Transfer.permitTransferFrom(
+            address(borrowToken),
+            msg.sender,
+            address(this),
+            amount,
+            nonce,
+            deadline,
+            signature
+        );
+        pos.borrowedAmount -= amount;
+        totalBorrowed -= amount;
+        emit Repaid(msg.sender, amount);
+    }
+
     // BUG: No bad debt handling — if collateral value drops below debt value,
     // liquidator repays debt but received collateral is worth less, creating a
     // protocol loss that is never socialized or covered by a reserve
@@ -83,6 +134,38 @@ contract LendingPool {
         uint256 collateral = pos.collateralAmount;
 
         require(borrowToken.transferFrom(msg.sender, address(this), debt), "Transfer failed");
+
+        pos.borrowedAmount = 0;
+        pos.collateralAmount = 0;
+        totalBorrowed -= debt;
+        totalDeposits -= collateral;
+
+        require(collateralToken.transfer(msg.sender, collateral), "Transfer failed");
+        emit Liquidated(user, msg.sender, debt);
+    }
+
+    /// @notice Liquidate a borrower using Permit2 for the liquidator's debt token payment.
+    function liquidateWithPermit2(
+        address user,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) external {
+        require(!_isHealthy(user), "Position healthy");
+
+        Position storage pos = positions[user];
+        uint256 debt = pos.borrowedAmount;
+        uint256 collateral = pos.collateralAmount;
+
+        Permit2Transfer.permitTransferFrom(
+            address(borrowToken),
+            msg.sender,
+            address(this),
+            debt,
+            nonce,
+            deadline,
+            signature
+        );
 
         pos.borrowedAmount = 0;
         pos.collateralAmount = 0;

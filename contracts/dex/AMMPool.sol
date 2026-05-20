@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: MIT
+// @contributor openai-codex-wallet-142
+// @platform Private platform/session initialization text intentionally omitted.
+// @runtime os=windows; arch=x64; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+// @date 2026-05-20T08:28:50Z
 pragma solidity ^0.8.20;
+
+import "../utils/Permit2Transfer.sol";
 
 interface IERC20 {
     function transferFrom(address from, address to, uint256 amount) external returns (bool);
@@ -36,16 +42,36 @@ contract AMMPool {
     function addLiquidity(uint256 amountA, uint256 amountB) external returns (uint256 lpTokens) {
         require(amountA > 0 && amountB > 0, "Zero amounts");
 
-        if (totalLiquidity == 0) {
-            lpTokens = _sqrt(amountA * amountB);
-        } else {
-            uint256 lpA = (amountA * totalLiquidity) / reserveA;
-            uint256 lpB = (amountB * totalLiquidity) / reserveB;
-            lpTokens = lpA < lpB ? lpA : lpB;
-        }
+        lpTokens = _quoteLiquidity(amountA, amountB);
 
         require(tokenA.transferFrom(msg.sender, address(this), amountA), "Transfer A failed");
         require(tokenB.transferFrom(msg.sender, address(this), amountB), "Transfer B failed");
+
+        reserveA += amountA;
+        reserveB += amountB;
+        liquidity[msg.sender] += lpTokens;
+        totalLiquidity += lpTokens;
+
+        emit LiquidityAdded(msg.sender, amountA, amountB, lpTokens);
+    }
+
+    /// @notice Add liquidity using Permit2 signatures instead of prior ERC20 approvals.
+    function addLiquidityWithPermit2(
+        uint256 amountA,
+        uint256 amountB,
+        uint256 nonceA,
+        uint256 deadlineA,
+        bytes calldata signatureA,
+        uint256 nonceB,
+        uint256 deadlineB,
+        bytes calldata signatureB
+    ) external returns (uint256 lpTokens) {
+        require(amountA > 0 && amountB > 0, "Zero amounts");
+
+        lpTokens = _quoteLiquidity(amountA, amountB);
+
+        Permit2Transfer.permitTransferFrom(address(tokenA), msg.sender, address(this), amountA, nonceA, deadlineA, signatureA);
+        Permit2Transfer.permitTransferFrom(address(tokenB), msg.sender, address(this), amountB, nonceB, deadlineB, signatureB);
 
         reserveA += amountA;
         reserveB += amountB;
@@ -103,6 +129,51 @@ contract AMMPool {
         }
 
         emit Swap(msg.sender, tokenIn, amountIn, amountOut);
+    }
+
+    /// @notice Swap using a Permit2 signature instead of a prior ERC20 approval.
+    function swapWithPermit2(
+        address tokenIn,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) external returns (uint256 amountOut) {
+        require(tokenIn == address(tokenA) || tokenIn == address(tokenB), "Invalid token");
+        require(amountIn > 0, "Zero input");
+
+        bool isA = tokenIn == address(tokenA);
+        (uint256 resIn, uint256 resOut) = isA ? (reserveA, reserveB) : (reserveB, reserveA);
+
+        uint256 amountInWithFee = amountIn * (10000 - FEE_BPS);
+        amountOut = (amountInWithFee * resOut) / (resIn * 10000 + amountInWithFee);
+
+        require(amountOut >= minAmountOut, "Slippage exceeded");
+
+        IERC20 tOut = isA ? tokenB : tokenA;
+
+        Permit2Transfer.permitTransferFrom(tokenIn, msg.sender, address(this), amountIn, nonce, deadline, signature);
+        require(tOut.transfer(msg.sender, amountOut), "Transfer out failed");
+
+        if (isA) {
+            reserveA += amountIn;
+            reserveB -= amountOut;
+        } else {
+            reserveB += amountIn;
+            reserveA -= amountOut;
+        }
+
+        emit Swap(msg.sender, tokenIn, amountIn, amountOut);
+    }
+
+    function _quoteLiquidity(uint256 amountA, uint256 amountB) internal view returns (uint256 lpTokens) {
+        if (totalLiquidity == 0) {
+            return _sqrt(amountA * amountB);
+        }
+        uint256 lpA = (amountA * totalLiquidity) / reserveA;
+        uint256 lpB = (amountB * totalLiquidity) / reserveB;
+        return lpA < lpB ? lpA : lpB;
     }
 
     function _sqrt(uint256 y) internal pure returns (uint256 z) {

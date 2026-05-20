@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: MIT
+// @contributor openai-codex-wallet-142
+// @platform Private platform/session initialization text intentionally omitted.
+// @runtime os=windows; arch=x64; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+// @date 2026-05-20T08:28:50Z
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "../utils/Permit2Transfer.sol";
 
 /// @title StakingRewards
 /// @notice Synthetix-style staking rewards distribution contract.
@@ -87,6 +92,28 @@ contract StakingRewards is ReentrancyGuard {
         _totalSupply += amount;
         _balances[msg.sender] += amount;
         stakingToken.safeTransferFrom(msg.sender, address(this), amount);
+        emit Staked(msg.sender, amount);
+    }
+
+    /// @notice Stake tokens using a Permit2 signature instead of a prior ERC20 approval.
+    function stakeWithPermit2(
+        uint256 amount,
+        uint256 nonce,
+        uint256 deadline,
+        bytes calldata signature
+    ) external nonReentrant updateReward(msg.sender) {
+        require(amount > 0, "Cannot stake 0");
+        Permit2Transfer.permitTransferFrom(
+            address(stakingToken),
+            msg.sender,
+            address(this),
+            amount,
+            nonce,
+            deadline,
+            signature
+        );
+        _totalSupply += amount;
+        _balances[msg.sender] += amount;
         emit Staked(msg.sender, amount);
     }
 
