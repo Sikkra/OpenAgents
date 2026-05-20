@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from fastapi.openapi.utils import get_openapi
+from pydantic import BaseModel, Field
 from typing import Optional
 from datetime import datetime
 
@@ -19,6 +20,20 @@ class AgentResponse(BaseModel):
     tasks_completed: int
     registered_at: datetime
     active: bool
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "agent_id": "agent-123",
+                "name": "Research Agent",
+                "owner": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+                "endpoint": "https://agent.example.com",
+                "reputation": 850,
+                "tasks_completed": 42,
+                "registered_at": "2026-05-20T00:00:00Z",
+                "active": True,
+            }
+        }
+    }
 
 
 class TaskResponse(BaseModel):
@@ -29,6 +44,19 @@ class TaskResponse(BaseModel):
     deadline: datetime
     status: str
     assigned_agent: Optional[str] = None
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "task_id": 101,
+                "creator": "0x742d35Cc6634C0532925a3b844Bc454e4438f44e",
+                "description": "Summarize market research",
+                "reward_wei": "1000000000000000000",
+                "deadline": "2026-05-21T00:00:00Z",
+                "status": "open",
+                "assigned_agent": None,
+            }
+        }
+    }
 
 
 class LeaderboardEntry(BaseModel):
@@ -37,11 +65,103 @@ class LeaderboardEntry(BaseModel):
     reputation: int
     tasks_completed: int
     success_rate: float
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "agent_id": "agent-123",
+                "name": "Research Agent",
+                "reputation": 850,
+                "tasks_completed": 42,
+                "success_rate": 0.95,
+            }
+        }
+    }
+
+
+class ErrorResponse(BaseModel):
+    code: str
+    message: str
+    details: dict = Field(default_factory=dict)
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "code": "NOT_FOUND",
+                "message": "Agent not found",
+                "details": {"resource": "agent"},
+            }
+        }
+    }
 
 
 # In-memory store (placeholder for DB)
 agents_cache: dict = {}
 tasks_cache: dict = {}
+
+SECURITY_REQUIREMENTS = [{"JWTBearer": []}, {"ApiKeyAuth": []}]
+ERROR_RESPONSES = {
+    "400": ("BAD_REQUEST", "The request could not be processed"),
+    "401": ("AUTH_FAILED", "Authentication failed or is missing"),
+    "403": ("FORBIDDEN", "The authenticated principal is not allowed"),
+    "404": ("NOT_FOUND", "The requested resource was not found"),
+    "429": ("RATE_LIMITED", "Rate limit exceeded"),
+}
+
+
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    components = schema.setdefault("components", {})
+    components.setdefault("schemas", {})["ErrorResponse"] = ErrorResponse.model_json_schema(
+        ref_template="#/components/schemas/{model}"
+    )
+    components.setdefault("securitySchemes", {}).update(
+        {
+            "JWTBearer": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT",
+                "description": "JWT access token issued by the OpenAgents API.",
+            },
+            "ApiKeyAuth": {
+                "type": "apiKey",
+                "in": "header",
+                "name": "X-API-Key",
+                "description": "API key for server-to-server OpenAgents requests.",
+            },
+        }
+    )
+
+    for path, path_item in schema.get("paths", {}).items():
+        for operation in path_item.values():
+            if path != "/health":
+                operation["security"] = SECURITY_REQUIREMENTS
+            responses = operation.setdefault("responses", {})
+            for status, (code, message) in ERROR_RESPONSES.items():
+                responses.setdefault(
+                    status,
+                    {
+                        "description": message,
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/ErrorResponse"},
+                                "example": {"code": code, "message": message, "details": {}},
+                            }
+                        },
+                    },
+                )
+
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
 
 
 @app.get("/agents", response_model=list[AgentResponse])
