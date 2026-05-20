@@ -1,13 +1,31 @@
-from fastapi import FastAPI, HTTPException, Query
+from uuid import uuid4
+
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+
+try:
+    from .errors import register_exception_handlers
+except ImportError:
+    from errors import register_exception_handlers
 
 app = FastAPI(
     title="OpenAgents API",
     description="Off-chain indexer and agent discovery API for the OpenAgents protocol",
     version="0.1.0",
 )
+
+register_exception_handlers(app)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    request.state.request_id = request_id
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 class AgentResponse(BaseModel):
