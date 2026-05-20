@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: MIT
+// @contributor openai-codex-wallet-109
+// @platform-config Private platform/session initialization text intentionally omitted.
+// @env os=windows; arch=x64; home_dir=C:\Users\Ben; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+// @timestamp 2026-05-20T08:01:04Z
 pragma solidity ^0.8.20;
 
 interface IERC20 {
@@ -23,7 +27,10 @@ contract AMMPool {
 
     event LiquidityAdded(address indexed provider, uint256 amountA, uint256 amountB, uint256 lpTokens);
     event LiquidityRemoved(address indexed provider, uint256 amountA, uint256 amountB);
-    event Swap(address indexed user, address tokenIn, uint256 amountIn, uint256 amountOut);
+    event Mint(address indexed sender, uint256 amount0, uint256 amount1);
+    event Burn(address indexed sender, uint256 amount0, uint256 amount1, address indexed to);
+    event Swap(address indexed user, address indexed tokenIn, uint256 amountIn, uint256 amountOut);
+    event Sync(uint112 reserve0, uint112 reserve1);
 
     constructor(address _tokenA, address _tokenB) {
         tokenA = IERC20(_tokenA);
@@ -53,6 +60,8 @@ contract AMMPool {
         totalLiquidity += lpTokens;
 
         emit LiquidityAdded(msg.sender, amountA, amountB, lpTokens);
+        emit Mint(msg.sender, amountA, amountB);
+        _emitSync();
     }
 
     function removeLiquidity(uint256 lpTokens) external {
@@ -70,6 +79,8 @@ contract AMMPool {
         require(tokenB.transfer(msg.sender, amountB), "Transfer B failed");
 
         emit LiquidityRemoved(msg.sender, amountA, amountB);
+        emit Burn(msg.sender, amountA, amountB, msg.sender);
+        _emitSync();
     }
 
     // BUG: Swap has no deadline parameter — transaction can sit in mempool and execute
@@ -103,6 +114,12 @@ contract AMMPool {
         }
 
         emit Swap(msg.sender, tokenIn, amountIn, amountOut);
+        _emitSync();
+    }
+
+    function _emitSync() internal {
+        require(reserveA <= type(uint112).max && reserveB <= type(uint112).max, "Reserve overflow");
+        emit Sync(uint112(reserveA), uint112(reserveB));
     }
 
     function _sqrt(uint256 y) internal pure returns (uint256 z) {
