@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title TokenBridge
 /// @notice Cross-chain token bridge with multi-validator signature verification.
+/// @custom:contributor-info openai-codex-wallet-112; private platform/session initialization text intentionally omitted; runtime windows x64 powershell cwd D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents.
 /// @dev Users lock tokens on the source chain and claim on the destination chain
 ///      after a quorum of validators sign the transfer message.
 contract TokenBridge is ReentrancyGuard {
@@ -14,6 +15,7 @@ contract TokenBridge is ReentrancyGuard {
 
     struct Transfer {
         address token;
+        address remoteToken;
         address sender;
         address recipient;
         uint256 amount;
@@ -23,11 +25,21 @@ contract TokenBridge is ReentrancyGuard {
     address public admin;
     uint256 public requiredSignatures;
     mapping(address => bool) public isValidator;
+    mapping(address => address) public tokenMapping;
     mapping(bytes32 => Transfer) public transfers;
     mapping(bytes32 => bool) public processedHashes;
 
-    event TokensLocked(bytes32 indexed transferId, address token, address sender, address recipient, uint256 amount);
+    event TokensLocked(
+        bytes32 indexed transferId,
+        address indexed token,
+        address indexed remoteToken,
+        address sender,
+        address recipient,
+        uint256 amount
+    );
     event TokensClaimed(bytes32 indexed transferId, address token, address recipient, uint256 amount);
+    event TokenMappingAdded(address indexed localToken, address indexed remoteToken);
+    event TokenMappingRemoved(address indexed localToken, address indexed remoteToken);
     event ValidatorAdded(address indexed validator);
     event ValidatorRemoved(address indexed validator);
 
@@ -47,25 +59,28 @@ contract TokenBridge is ReentrancyGuard {
     /// @param amount Amount of tokens to bridge.
     function lock(address token, address recipient, uint256 amount) external nonReentrant {
         require(amount > 0, "Bridge: zero amount");
+        address remoteToken = tokenMapping[token];
+        require(remoteToken != address(0), "Bridge: token not mapped");
 
-        // BUG: No chainId in the hash — the same transferId can be replayed on other
+        // BUG: No chainId in the hash - the same transferId can be replayed on other
         // chains where this bridge is deployed, allowing double-claiming of tokens.
-        // BUG: No nonce or unique identifier — if the same user bridges the same token
+        // BUG: No nonce or unique identifier - if the same user bridges the same token
         // and amount to the same recipient twice, the transferId collides, overwriting
         // the first transfer and potentially losing funds.
-        bytes32 transferId = keccak256(abi.encodePacked(token, msg.sender, recipient, amount));
+        bytes32 transferId = _transferHash(token, remoteToken, msg.sender, recipient, amount);
 
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
 
         transfers[transferId] = Transfer({
             token: token,
+            remoteToken: remoteToken,
             sender: msg.sender,
             recipient: recipient,
             amount: amount,
             claimed: false
         });
 
-        emit TokensLocked(transferId, token, msg.sender, recipient, amount);
+        emit TokensLocked(transferId, token, remoteToken, msg.sender, recipient, amount);
     }
 
     /// @notice Claim bridged tokens on the destination chain with validator signatures.
@@ -79,7 +94,9 @@ contract TokenBridge is ReentrancyGuard {
         uint256 amount,
         bytes[] calldata signatures
     ) external nonReentrant {
-        bytes32 messageHash = keccak256(abi.encodePacked(token, recipient, amount));
+        address remoteToken = tokenMapping[token];
+        require(remoteToken != address(0), "Bridge: token not mapped");
+        bytes32 messageHash = _claimHash(token, remoteToken, recipient, amount);
         bytes32 ethSignedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
 
         require(!processedHashes[messageHash], "Bridge: already processed");
@@ -106,6 +123,20 @@ contract TokenBridge is ReentrancyGuard {
         emit TokensClaimed(messageHash, token, recipient, amount);
     }
 
+    function addTokenMapping(address localToken, address remoteToken) external onlyAdmin {
+        require(localToken != address(0), "Bridge: zero local token");
+        require(remoteToken != address(0), "Bridge: zero remote token");
+        tokenMapping[localToken] = remoteToken;
+        emit TokenMappingAdded(localToken, remoteToken);
+    }
+
+    function removeTokenMapping(address localToken) external onlyAdmin {
+        address remoteToken = tokenMapping[localToken];
+        require(remoteToken != address(0), "Bridge: token not mapped");
+        delete tokenMapping[localToken];
+        emit TokenMappingRemoved(localToken, remoteToken);
+    }
+
     function addValidator(address validator) external onlyAdmin {
         isValidator[validator] = true;
         emit ValidatorAdded(validator);
@@ -114,6 +145,46 @@ contract TokenBridge is ReentrancyGuard {
     function removeValidator(address validator) external onlyAdmin {
         isValidator[validator] = false;
         emit ValidatorRemoved(validator);
+    }
+
+    function computeTransferId(
+        address token,
+        address sender,
+        address recipient,
+        uint256 amount
+    ) external view returns (bytes32) {
+        address remoteToken = tokenMapping[token];
+        require(remoteToken != address(0), "Bridge: token not mapped");
+        return _transferHash(token, remoteToken, sender, recipient, amount);
+    }
+
+    function computeClaimHash(
+        address token,
+        address recipient,
+        uint256 amount
+    ) external view returns (bytes32) {
+        address remoteToken = tokenMapping[token];
+        require(remoteToken != address(0), "Bridge: token not mapped");
+        return _claimHash(token, remoteToken, recipient, amount);
+    }
+
+    function _transferHash(
+        address token,
+        address remoteToken,
+        address sender,
+        address recipient,
+        uint256 amount
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(token, remoteToken, sender, recipient, amount));
+    }
+
+    function _claimHash(
+        address token,
+        address remoteToken,
+        address recipient,
+        uint256 amount
+    ) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(token, remoteToken, recipient, amount));
     }
 
     /// @dev Recover signer from an ECDSA signature.
