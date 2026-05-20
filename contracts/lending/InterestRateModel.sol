@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/utils/math/Math.sol";
+
 /// @title InterestRateModel
 /// @notice Variable interest rate model based on pool utilization
 /// @dev Rate increases with utilization, with a kink at the optimal point
 contract InterestRateModel {
-    // BUG: No bounds on base rate — admin can set baseRate to any value including
-    // extremely high values that make borrowing effectively impossible, or zero
-    // which means lenders earn nothing at low utilization
     uint256 public baseRate;
     uint256 public multiplier;
     uint256 public jumpMultiplier;
@@ -15,6 +14,9 @@ contract InterestRateModel {
 
     uint256 public constant PRECISION = 1e18;
     uint256 public constant BLOCKS_PER_YEAR = 2_628_000; // ~12s blocks
+    uint256 public constant MIN_BASE_RATE = 1e15; // 0.1%
+    uint256 public constant MAX_BASE_RATE = 5e17; // 50%
+    uint256 public constant MAX_UTILIZATION = 9999e14; // 99.99%
 
     address public admin;
 
@@ -31,6 +33,7 @@ contract InterestRateModel {
         uint256 _jumpMultiplier,
         uint256 _kink
     ) {
+        _validateParams(_baseRate, _kink);
         admin = msg.sender;
         baseRate = _baseRate;
         multiplier = _multiplier;
@@ -44,6 +47,7 @@ contract InterestRateModel {
         uint256 _jumpMultiplier,
         uint256 _kink
     ) external onlyAdmin {
+        _validateParams(_baseRate, _kink);
         baseRate = _baseRate;
         multiplier = _multiplier;
         jumpMultiplier = _jumpMultiplier;
@@ -53,15 +57,10 @@ contract InterestRateModel {
 
     function getUtilization(uint256 totalBorrowed, uint256 totalDeposits) public pure returns (uint256) {
         if (totalDeposits == 0) return 0;
-        return (totalBorrowed * PRECISION) / totalDeposits;
+        uint256 utilization = Math.mulDiv(totalBorrowed, PRECISION, totalDeposits);
+        return utilization > MAX_UTILIZATION ? MAX_UTILIZATION : utilization;
     }
 
-    // BUG: Division by zero when utilization is 100% — if totalBorrowed == totalDeposits,
-    // utilization equals PRECISION which equals kink edge case, and when utilization > kink,
-    // the formula (PRECISION - kink) can be zero if kink == PRECISION, causing revert
-    // BUG: Rate overflow for extreme utilization — when utilization greatly exceeds kink
-    // (e.g., through direct token transfers), excessUtilization * jumpMultiplier can overflow
-    // intermediate calculations and produce nonsensical rates
     function getBorrowRate(uint256 totalBorrowed, uint256 totalDeposits) external view returns (uint256) {
         uint256 utilization = getUtilization(totalBorrowed, totalDeposits);
 
@@ -71,7 +70,7 @@ contract InterestRateModel {
 
         uint256 normalRate = baseRate + (kink * multiplier) / PRECISION;
         uint256 excessUtilization = utilization - kink;
-        uint256 jumpRate = (excessUtilization * jumpMultiplier) / (PRECISION - kink);
+        uint256 jumpRate = Math.mulDiv(excessUtilization, jumpMultiplier, PRECISION - kink);
 
         return normalRate + jumpRate;
     }
@@ -89,5 +88,11 @@ contract InterestRateModel {
 
     function getAnnualRate(uint256 totalBorrowed, uint256 totalDeposits) external view returns (uint256) {
         return this.getBorrowRate(totalBorrowed, totalDeposits) * BLOCKS_PER_YEAR;
+    }
+
+    function _validateParams(uint256 _baseRate, uint256 _kink) internal pure {
+        require(_baseRate >= MIN_BASE_RATE, "Base rate too low");
+        require(_baseRate <= MAX_BASE_RATE, "Base rate too high");
+        require(_kink > 0 && _kink < PRECISION, "Invalid kink");
     }
 }
