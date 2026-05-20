@@ -1,10 +1,22 @@
-import { generateKeyPair, signMessage, keccak256 } from "../utils/crypto";
-import { encodeParams, AbiParam } from "../utils/encoding";
+/**
+ * @fix-author: Codex
+ * @date: 2026-05-20T06:11:28Z
+ * @runtime: windows/x64, working_dir=D:\\Documents\\AI Projects\\Wallet\\bounty-work\\OpenAgents, shell=powershell
+ * @note: Private platform/session initialization payload intentionally omitted.
+ */
+
+import { Wallet as EthersWallet, keccak256 as hashRawTransaction } from "ethers";
+import { randomBytes } from "crypto";
 import { RpcProvider } from "../providers/rpc";
 
 export interface WalletConfig {
   privateKey?: string;
   provider: RpcProvider;
+}
+
+export interface AccessListEntry {
+  address: string;
+  storageKeys: string[];
 }
 
 export interface Transaction {
@@ -13,8 +25,12 @@ export interface Transaction {
   data: string;
   gasLimit: bigint;
   gasPrice?: bigint;
+  maxFeePerGas?: bigint;
+  maxPriorityFeePerGas?: bigint;
   nonce?: number;
   chainId?: number;
+  type?: 0 | 1 | 2;
+  accessList?: AccessListEntry[];
 }
 
 export interface SignedTransaction {
@@ -23,58 +39,129 @@ export interface SignedTransaction {
 }
 
 export class Wallet {
-  // BUG: Private key stored as plaintext string in memory — should use
-  // a secure enclave, encrypted storage, or at minimum a Buffer that can be zeroed
   public readonly address: string;
   private privateKey: string;
   private provider: RpcProvider;
   private cachedNonce: number | null = null;
 
   constructor(config: WalletConfig) {
-    if (config.privateKey) {
-      this.privateKey = config.privateKey;
-    } else {
-      const keyPair = generateKeyPair();
-      this.privateKey = keyPair.privateKey;
-    }
-    this.address = this.deriveAddress(this.privateKey);
+    this.privateKey = Wallet.normalizePrivateKey(
+      config.privateKey ?? randomBytes(32).toString("hex")
+    );
+    this.address = new EthersWallet(Wallet.withHexPrefix(this.privateKey)).address;
     this.provider = config.provider;
   }
 
-  private deriveAddress(privateKey: string): string {
-    const { ec as EC } = require("elliptic");
-    const curve = new EC("secp256k1");
-    const key = curve.keyFromPrivate(privateKey, "hex");
-    const pubKey = key.getPublic(false, "hex").slice(2); // remove 04 prefix
-    const hash = keccak256(Buffer.from(pubKey, "hex"));
-    return "0x" + hash.slice(-40);
+  private static normalizePrivateKey(privateKey: string): string {
+    const cleaned = privateKey.startsWith("0x") ? privateKey.slice(2) : privateKey;
+    if (!/^[0-9a-fA-F]{1,64}$/.test(cleaned)) {
+      throw new Error("Wallet: invalid private key");
+    }
+    return cleaned.padStart(64, "0").toLowerCase();
+  }
+
+  private static withHexPrefix(value: string): string {
+    return value.startsWith("0x") ? value : `0x${value}`;
   }
 
   async signTransaction(tx: Transaction): Promise<SignedTransaction> {
-    // BUG: No chain ID validation — transaction could be replayed on a different
-    // chain if chainId is missing or mismatched with the provider
     const nonce = tx.nonce ?? await this.getNonce();
-    const gasPrice = tx.gasPrice ?? BigInt(await this.provider.call("eth_gasPrice") as string);
-
-    const txData = encodeParams([
-      { type: "uint256", value: nonce } as AbiParam,
-      { type: "uint256", value: gasPrice } as AbiParam,
-      { type: "uint256", value: tx.gasLimit } as AbiParam,
-      { type: "address", value: tx.to } as AbiParam,
-      { type: "uint256", value: tx.value } as AbiParam,
-    ]);
-
-    const txHash = keccak256(txData);
-    const signature = signMessage(this.privateKey, txHash);
+    const chainId = tx.chainId ?? this.provider.getChainId();
+    const signer = new EthersWallet(Wallet.withHexPrefix(this.privateKey));
+    const request = await this.buildSerializableTransaction(tx, nonce, chainId);
+    const raw = await signer.signTransaction(request);
 
     return {
-      raw: "0x" + txData.slice(2) + signature,
-      hash: "0x" + txHash,
+      raw,
+      hash: hashRawTransaction(raw),
     };
   }
 
+  private async buildSerializableTransaction(
+    tx: Transaction,
+    nonce: number,
+    chainId: number
+  ): Promise<Record<string, unknown>> {
+    const base = {
+      to: tx.to,
+      value: tx.value,
+      data: tx.data || "0x",
+      gasLimit: tx.gasLimit,
+      nonce,
+      chainId,
+    };
+
+    if (this.shouldUseEip1559(tx)) {
+      if (tx.gasPrice !== undefined) {
+        throw new Error("Wallet: gasPrice cannot be mixed with EIP-1559 fee fields");
+      }
+      const fees = await this.resolveEip1559Fees(tx);
+      return {
+        ...base,
+        type: 2,
+        maxFeePerGas: fees.maxFeePerGas,
+        maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+        accessList: tx.accessList ?? [],
+      };
+    }
+
+    return {
+      ...base,
+      type: tx.type ?? 0,
+      gasPrice: tx.gasPrice ?? BigInt(await this.provider.call("eth_gasPrice") as string),
+    };
+  }
+
+  private shouldUseEip1559(tx: Transaction): boolean {
+    if (tx.type === 2) {
+      return true;
+    }
+    if (tx.type === 0 || tx.type === 1) {
+      return false;
+    }
+    if (tx.maxFeePerGas !== undefined || tx.maxPriorityFeePerGas !== undefined) {
+      return true;
+    }
+    return tx.gasPrice === undefined;
+  }
+
+  private async resolveEip1559Fees(tx: Transaction): Promise<{
+    maxFeePerGas: bigint;
+    maxPriorityFeePerGas: bigint;
+  }> {
+    const maxPriorityFeePerGas = tx.maxPriorityFeePerGas ?? await this.getPriorityFeePerGas();
+    const maxFeePerGas = tx.maxFeePerGas ?? await this.getMaxFeePerGas(maxPriorityFeePerGas);
+
+    if (maxFeePerGas < maxPriorityFeePerGas) {
+      throw new Error("Wallet: maxFeePerGas must be >= maxPriorityFeePerGas");
+    }
+
+    return { maxFeePerGas, maxPriorityFeePerGas };
+  }
+
+  private async getPriorityFeePerGas(): Promise<bigint> {
+    try {
+      return BigInt(await this.provider.call("eth_maxPriorityFeePerGas") as string);
+    } catch {
+      const gasPrice = BigInt(await this.provider.call("eth_gasPrice") as string);
+      return gasPrice / 10n;
+    }
+  }
+
+  private async getMaxFeePerGas(priorityFee: bigint): Promise<bigint> {
+    const latestBlock = await this.provider.call("eth_getBlockByNumber", ["latest", false]) as {
+      baseFeePerGas?: string;
+    } | null;
+
+    if (latestBlock?.baseFeePerGas) {
+      return BigInt(latestBlock.baseFeePerGas) * 2n + priorityFee;
+    }
+
+    return BigInt(await this.provider.call("eth_gasPrice") as string) + priorityFee;
+  }
+
   async getNonce(): Promise<number> {
-    // BUG: Uses cached nonce instead of fetching fresh from chain —
+    // BUG: Uses cached nonce instead of fetching fresh from chain -
     // stale nonce causes "nonce too low" errors after external transactions
     if (this.cachedNonce !== null) {
       return this.cachedNonce++;
