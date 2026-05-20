@@ -4,9 +4,8 @@ from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Text, JSON,
     ForeignKey, DateTime, Enum as SAEnum,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
-from datetime import datetime
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from datetime import datetime, timezone
 import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./openagents.db")
@@ -14,6 +13,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./openagents.db")
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+def utc_now():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def get_db():
@@ -31,7 +34,7 @@ class User(Base):
     address = Column(String(42), unique=True, nullable=False)
     username = Column(String(64), unique=True, nullable=True)
     # BUG: No index on address — wallet lookups on every auth request do full table scans
-    created_at = Column(DateTime, default=datetime.utcnow)  # BUG: naive datetime, no timezone
+    created_at = Column(DateTime, default=utc_now)
 
     agents = relationship("Agent", back_populates="owner")
 
@@ -45,7 +48,7 @@ class Agent(Base):
     model_type = Column(String(32), default="gpt-4")
     config = Column(JSON, default=dict)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
 
     # BUG: No cascade delete — deleting a user leaves orphaned agents
     owner = relationship("User", back_populates="agents")
@@ -62,7 +65,7 @@ class Task(Base):
     status = Column(String(32), default="open")
     creator_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
     updated_at = Column(DateTime, nullable=True)
     deadline = Column(DateTime, nullable=True)
 
@@ -80,10 +83,25 @@ class Payment(Base):
     amount = Column(Float, nullable=False)
     token_address = Column(String(42), default="0x0000000000000000000000000000000000000000")
     status = Column(String(32), default="pending")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=utc_now)
+    release_time = Column(DateTime, nullable=True)
+    expired_at = Column(DateTime, nullable=True)
     claimed_at = Column(DateTime, nullable=True)
+    refunded_at = Column(DateTime, nullable=True)
 
     task = relationship("Task", back_populates="payments")
+
+
+class PaymentRefundLog(Base):
+    __tablename__ = "payment_refund_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    payment_id = Column(Integer, ForeignKey("payments.id"), nullable=False)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False)
+    amount = Column(Float, nullable=False)
+    refunded_to = Column(String(42), nullable=False)
+    reason = Column(String(64), nullable=False)
+    created_at = Column(DateTime, default=utc_now)
 
 
 def init_db():

@@ -3,12 +3,22 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
-from ..models.database import get_db, Payment, Task
+from ..models.database import get_db, Payment, PaymentRefundLog, Task
 from ..middleware.auth import get_current_user
 
 router = APIRouter(prefix="/payments", tags=["payments"])
+AUTO_REFUND_GRACE_PERIOD = timedelta(days=30)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def escrow_expired_at(payment: Payment, task: Optional[Task] = None) -> datetime:
+    release_time = payment.release_time or (task.deadline if task else None) or payment.created_at
+    return payment.expired_at or (release_time + AUTO_REFUND_GRACE_PERIOD)
 
 
 class EscrowDeposit(BaseModel):
@@ -36,13 +46,17 @@ async def deposit_escrow(
 
     # BUG: No idempotency key — retried requests create duplicate escrow entries,
     # locking more funds than intended
+    now = utc_now()
+    release_time = task.deadline or now
     payment = Payment(
         task_id=deposit.task_id,
         from_address=user["address"],
         amount=deposit.amount,
         token_address=deposit.token_address,
         status="escrowed",
-        created_at=datetime.utcnow(),
+        created_at=now,
+        release_time=release_time,
+        expired_at=release_time + AUTO_REFUND_GRACE_PERIOD,
     )
     db.add(payment)
     db.commit()
@@ -82,7 +96,7 @@ async def claim_payment(
     for payment in payments:
         payment.status = "claimed"
         payment.to_address = claim.recipient_address
-        payment.claimed_at = datetime.utcnow()
+        payment.claimed_at = utc_now()
         total_claimed += payment.amount
 
     db.commit()
@@ -91,6 +105,45 @@ async def claim_payment(
         "claimed_amount": total_claimed,
         "recipient": claim.recipient_address,
     }
+
+
+@router.post("/process-expired")
+async def process_expired_escrows(user=Depends(get_current_user), db=Depends(get_db)):
+    now = utc_now()
+    payments = db.query(Payment).filter(Payment.status == "escrowed").all()
+    refunded = []
+
+    for payment in payments:
+        task = db.query(Task).filter(Task.id == payment.task_id).first()
+        expired_at = escrow_expired_at(payment, task)
+        if expired_at > now:
+            continue
+
+        payment.status = "refunded"
+        payment.to_address = payment.from_address
+        payment.refunded_at = now
+        payment.expired_at = expired_at
+
+        log = PaymentRefundLog(
+            payment_id=payment.id,
+            task_id=payment.task_id,
+            amount=payment.amount,
+            refunded_to=payment.from_address,
+            reason="expired",
+            created_at=now,
+        )
+        db.add(log)
+        refunded.append({
+            "payment_id": payment.id,
+            "task_id": payment.task_id,
+            "amount": payment.amount,
+            "refunded_to": payment.from_address,
+            "refunded_at": now.isoformat(),
+            "expired_at": expired_at.isoformat(),
+        })
+
+    db.commit()
+    return {"processed": len(payments), "refunded": len(refunded), "refunds": refunded}
 
 
 @router.get("/history")
