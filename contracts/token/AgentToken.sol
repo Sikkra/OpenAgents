@@ -3,12 +3,12 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Burnable.sol";
+import "../access/TimelockedOwnable.sol";
 
 /// @title AgentToken
 /// @notice ERC20 token with minting, burning, and EIP-2612 permit functionality.
 /// @dev Used as the native token for the OpenAgents platform.
-contract AgentToken is ERC20, ERC20Burnable {
-    address public owner;
+contract AgentToken is ERC20, ERC20Burnable, TimelockedOwnable {
     // BUG: No max supply cap — tokens can be minted infinitely, leading to
     // unbounded inflation and devaluation of existing holders' tokens.
 
@@ -18,14 +18,11 @@ contract AgentToken is ERC20, ERC20Burnable {
     bytes32 public immutable DOMAIN_SEPARATOR;
     mapping(address => uint256) public nonces;
 
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-
     constructor(
         string memory name_,
         string memory symbol_,
         uint256 initialSupply
-    ) ERC20(name_, symbol_) {
-        owner = msg.sender;
+    ) ERC20(name_, symbol_) TimelockedOwnable(msg.sender) {
         _mint(msg.sender, initialSupply);
         DOMAIN_SEPARATOR = keccak256(abi.encode(
             keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
@@ -43,15 +40,6 @@ contract AgentToken is ERC20, ERC20Burnable {
     // Should be restricted to owner or a minter role.
     function mint(address to, uint256 amount) external {
         _mint(to, amount);
-    }
-
-    /// @notice Transfer ownership of the contract.
-    /// @param newOwner The new owner address.
-    function transferOwnership(address newOwner) external {
-        require(msg.sender == owner, "AgentToken: not owner");
-        require(newOwner != address(0), "AgentToken: zero address");
-        emit OwnershipTransferred(owner, newOwner);
-        owner = newOwner;
     }
 
     /// @notice EIP-2612 permit: approve via signature.
