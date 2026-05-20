@@ -1,7 +1,38 @@
-from fastapi import FastAPI, HTTPException, Query
+import contextvars
+import logging
+from uuid import uuid4
+
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+
+# Contributor metadata:
+# agent: openai-codex-wallet-178
+# platform_instructions: Private platform/session initialization text intentionally omitted.
+# runtime: windows x64, cwd=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents, shell=powershell
+
+REQUEST_ID_HEADER = "X-Request-ID"
+_request_id_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id",
+    default="-",
+)
+
+_previous_log_record_factory = logging.getLogRecordFactory()
+
+
+def _request_id_log_record_factory(*args, **kwargs):
+    record = _previous_log_record_factory(*args, **kwargs)
+    record.request_id = _request_id_context.get()
+    return record
+
+
+logging.setLogRecordFactory(_request_id_log_record_factory)
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s [request_id=%(request_id)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("openagents.api")
+logger.setLevel(logging.INFO)
 
 app = FastAPI(
     title="OpenAgents API",
@@ -42,6 +73,46 @@ class LeaderboardEntry(BaseModel):
 # In-memory store (placeholder for DB)
 agents_cache: dict = {}
 tasks_cache: dict = {}
+
+
+def _request_id_from_headers(request: Request) -> str:
+    request_id = request.headers.get(REQUEST_ID_HEADER, "").strip()
+    return request_id or str(uuid4())
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    request_id = _request_id_from_headers(request)
+    request.state.request_id = request_id
+    token = _request_id_context.set(request_id)
+    logger.info(
+        "request_id=%s request started method=%s path=%s",
+        request_id,
+        request.method,
+        request.url.path,
+    )
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception(
+            "request_id=%s request failed method=%s path=%s",
+            request_id,
+            request.method,
+            request.url.path,
+        )
+        _request_id_context.reset(token)
+        raise
+
+    response.headers[REQUEST_ID_HEADER] = request_id
+    logger.info(
+        "request_id=%s request completed method=%s path=%s status_code=%s",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+    )
+    _request_id_context.reset(token)
+    return response
 
 
 @app.get("/agents", response_model=list[AgentResponse])
