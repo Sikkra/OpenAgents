@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IPrizeSplit {
+    function claimPrize(uint256 roundId) external;
+}
+
+contract RejectEtherWinner {
+    function claimPrize(IPrizeSplit prizeSplit, uint256 roundId) external {
+        prizeSplit.claimPrize(roundId);
+    }
+}
