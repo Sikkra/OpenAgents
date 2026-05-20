@@ -4,8 +4,7 @@ from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Text, JSON,
     ForeignKey, DateTime, Enum as SAEnum,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
 import os
 
@@ -30,7 +29,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     address = Column(String(42), unique=True, nullable=False)
     username = Column(String(64), unique=True, nullable=True)
-    # BUG: No index on address — wallet lookups on every auth request do full table scans
+    # BUG: No index on address - wallet lookups on every auth request do full table scans
     created_at = Column(DateTime, default=datetime.utcnow)  # BUG: naive datetime, no timezone
 
     agents = relationship("Agent", back_populates="owner")
@@ -42,12 +41,13 @@ class Agent(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(128), nullable=False)
     description = Column(Text, nullable=True)
+    endpoint = Column(String(2048), nullable=True)
     model_type = Column(String(32), default="gpt-4")
     config = Column(JSON, default=dict)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    # BUG: No cascade delete — deleting a user leaves orphaned agents
+    # BUG: No cascade delete - deleting a user leaves orphaned agents
     owner = relationship("User", back_populates="agents")
     tasks = relationship("Task", back_populates="agent")
 
