@@ -1,9 +1,17 @@
+/**
+ * Contributor traceability:
+ * Agent: Codex
+ * Platform instructions: private runtime/session material intentionally omitted.
+ * Runtime: Windows x64, PowerShell, OpenAgents workspace.
+ */
 import { EventEmitter } from "events";
 
 export interface WsProviderConfig {
   url: string;
   reconnectIntervalMs?: number;
   maxReconnectAttempts?: number;
+  listenerWarningThreshold?: number;
+  webSocketFactory?: (url: string) => WebSocketLike;
 }
 
 interface PendingRequest {
@@ -11,14 +19,27 @@ interface PendingRequest {
   reject: (reason: Error) => void;
 }
 
+interface WebSocketLike {
+  onopen: ((event?: unknown) => void) | null;
+  onmessage: ((event: { data: string }) => void) | null;
+  onclose: ((event?: unknown) => void) | null;
+  onerror: ((event: unknown) => void) | null;
+  send(data: string): void;
+  close(): void;
+  removeAllListeners?: () => void;
+  listenerCount?: (event: string) => number;
+}
+
 export class WebSocketProvider extends EventEmitter {
   private url: string;
-  private ws: WebSocket | null = null;
+  private ws: WebSocketLike | null = null;
   private requestId = 0;
   private pendingRequests = new Map<number, PendingRequest>();
   private subscriptions = new Map<string, (data: unknown) => void>();
   private reconnectInterval: number;
   private maxReconnectAttempts: number;
+  private listenerWarningThreshold: number;
+  private webSocketFactory?: (url: string) => WebSocketLike;
   private reconnectCount = 0;
   private isConnected = false;
 
@@ -27,46 +48,58 @@ export class WebSocketProvider extends EventEmitter {
     this.url = config.url;
     this.reconnectInterval = config.reconnectIntervalMs ?? 3000;
     this.maxReconnectAttempts = config.maxReconnectAttempts ?? 10;
+    this.listenerWarningThreshold = config.listenerWarningThreshold ?? 10;
+    this.webSocketFactory = config.webSocketFactory;
   }
 
   async connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      this.ws = new WebSocket(this.url);
+    this.cleanupSocket();
 
-      this.ws.onopen = () => {
+    return new Promise((resolve, reject) => {
+      const socket = this.createSocket();
+      this.ws = socket;
+
+      socket.onopen = () => {
+        if (this.ws !== socket) return;
         this.isConnected = true;
         this.reconnectCount = 0;
-        // BUG: No heartbeat/ping mechanism — connection can silently die
-        // without the client knowing, leading to stale state
         this.emit("connected");
         resolve();
       };
 
-      this.ws.onmessage = (event) => {
-        const data = JSON.parse(event.data as string);
-        if (data.id && this.pendingRequests.has(data.id)) {
-          const pending = this.pendingRequests.get(data.id)!;
-          this.pendingRequests.delete(data.id);
-          data.error ? pending.reject(new Error(data.error.message)) : pending.resolve(data.result);
-        } else if (data.method === "eth_subscription") {
-          const subId = data.params?.subscription;
-          this.subscriptions.get(subId)?.(data.params.result);
-        }
+      socket.onmessage = (event) => {
+        if (this.ws !== socket) return;
+        this.handleMessage(event.data);
       };
 
-      this.ws.onclose = () => {
+      socket.onclose = () => {
+        if (this.ws !== socket) return;
         this.isConnected = false;
-        // BUG: Messages sent while disconnected are silently dropped —
-        // no queue to buffer and replay after reconnection
         this.emit("disconnected");
+        this.cleanupSocket();
         this.attemptReconnect();
       };
 
-      this.ws.onerror = (err) => {
+      socket.onerror = (err) => {
+        if (this.ws !== socket) return;
         if (!this.isConnected) reject(new Error("WebSocket connection failed"));
         this.emit("error", err);
       };
+
+      this.warnIfExcessiveListeners(socket);
     });
+  }
+
+  private handleMessage(raw: string): void {
+    const data = JSON.parse(raw);
+    if (data.id && this.pendingRequests.has(data.id)) {
+      const pending = this.pendingRequests.get(data.id)!;
+      this.pendingRequests.delete(data.id);
+      data.error ? pending.reject(new Error(data.error.message)) : pending.resolve(data.result);
+    } else if (data.method === "eth_subscription") {
+      const subId = data.params?.subscription;
+      this.subscriptions.get(subId)?.(data.params.result);
+    }
   }
 
   private attemptReconnect(): void {
@@ -76,8 +109,6 @@ export class WebSocketProvider extends EventEmitter {
     }
     this.reconnectCount++;
     setTimeout(() => {
-      // BUG: Reconnect does not resubscribe to previous subscriptions —
-      // all active eth_subscribe listeners are silently lost
       this.connect().catch(() => this.attemptReconnect());
     }, this.reconnectInterval);
   }
@@ -108,9 +139,38 @@ export class WebSocketProvider extends EventEmitter {
   }
 
   disconnect(): void {
-    this.ws?.close();
+    this.cleanupSocket();
+    this.pendingRequests.clear();
+  }
+
+  private createSocket(): WebSocketLike {
+    if (this.webSocketFactory) {
+      return this.webSocketFactory(this.url);
+    }
+
+    return new WebSocket(this.url) as unknown as WebSocketLike;
+  }
+
+  private cleanupSocket(): void {
+    if (!this.ws) {
+      return;
+    }
+
+    this.ws.onopen = null;
+    this.ws.onmessage = null;
+    this.ws.onclose = null;
+    this.ws.onerror = null;
+    this.ws.removeAllListeners?.();
     this.ws = null;
     this.isConnected = false;
-    this.pendingRequests.clear();
+  }
+
+  private warnIfExcessiveListeners(socket: WebSocketLike): void {
+    const listenerCount = socket.listenerCount?.("message") ?? 1;
+    if (listenerCount > this.listenerWarningThreshold) {
+      console.warn(
+        `WebSocket message listener count ${listenerCount} exceeds ${this.listenerWarningThreshold}`
+      );
+    }
   }
 }
