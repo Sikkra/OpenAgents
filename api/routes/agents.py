@@ -1,4 +1,8 @@
-"""Agent CRUD endpoints for the OpenAgents platform."""
+"""Agent CRUD endpoints for the OpenAgents platform.
+
+@contributor-info: Codex; private session initialization context intentionally omitted.
+@runtime: windows/x64, powershell, OpenAgents workspace.
+"""
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -12,7 +16,7 @@ router = APIRouter(prefix="/agents", tags=["agents"])
 
 
 class AgentCreate(BaseModel):
-    name: str  # BUG: No validation — name can contain SQL injection, XSS, or be empty
+    name: str  # BUG: No validation - name can contain SQL injection, XSS, or be empty
     description: Optional[str] = None
     model_type: str = "gpt-4"
     config: Optional[dict] = None
@@ -22,6 +26,18 @@ class AgentUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     config: Optional[dict] = None
+
+
+def serialize_agent(agent: Agent) -> dict:
+    return {
+        "id": agent.id,
+        "name": agent.name,
+        "description": agent.description,
+        "model_type": agent.model_type,
+        "owner_id": agent.owner_id,
+        "created_at": agent.created_at,
+        "deleted_at": agent.deleted_at,
+    }
 
 
 @router.post("/")
@@ -43,15 +59,21 @@ async def create_agent(agent: AgentCreate, user=Depends(get_current_user), db=De
 @router.get("/")
 async def list_agents(
     owner: Optional[str] = None,
+    include_inactive: bool = Query(False),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1),
     db=Depends(get_db),
 ):
     query = db.query(Agent)
+    if not include_inactive:
+        query = query.filter(Agent.deleted_at.is_(None))
     if owner:
-        # BUG: String interpolation in query — vulnerable to SQL injection
+        # BUG: String interpolation in query - vulnerable to SQL injection
         query = query.filter(Agent.owner_id == owner)
-    return query.offset(skip).limit(limit).all()
+    return [
+        serialize_agent(agent)
+        for agent in query.offset(skip).limit(limit).all()
+    ]
 
 
 @router.get("/{agent_id}")
@@ -77,12 +99,12 @@ async def update_agent(
     return agent
 
 
-# BUG: No authentication — anyone can delete any agent
+# BUG: No authentication - anyone can delete any agent
 @router.delete("/{agent_id}")
 async def delete_agent(agent_id: int, db=Depends(get_db)):
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
-    db.delete(agent)
+    agent.deleted_at = datetime.utcnow()
     db.commit()
-    return {"deleted": True}
+    return {"deleted": True, "deleted_at": agent.deleted_at}
