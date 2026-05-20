@@ -9,6 +9,24 @@ export interface AgentConfig {
   routerAddress: string;
 }
 
+export interface EventSubscriptionOptions {
+  indexedFilters?: Record<string, unknown>;
+  autoReconnect?: boolean;
+  reconnectDelayMs?: number;
+}
+
+export interface DecodedContractEvent {
+  name: string;
+  args: Record<string, unknown>;
+  values: unknown[];
+  log?: unknown;
+}
+
+export interface EventSubscription {
+  unsubscribe(): void;
+  resubscribe(): Promise<void>;
+}
+
 export class OpenAgentsSDK {
   private provider: ethers.JsonRpcProvider;
   private signer: ethers.Wallet;
@@ -58,6 +76,73 @@ export class OpenAgentsSDK {
       ethers.toUtf8Bytes(result)
     );
     await tx.wait();
+  }
+
+  subscribeToEvents(
+    contract: ethers.Contract,
+    eventName: string,
+    callback: (event: DecodedContractEvent) => void | Promise<void>,
+    options: EventSubscriptionOptions = {}
+  ): EventSubscription {
+    const eventFragment = contract.interface.getEvent(eventName);
+    if (!eventFragment) {
+      throw new Error(`Unknown event: ${eventName}`);
+    }
+
+    const indexedInputs = eventFragment.inputs.filter((input) => input.indexed);
+    const filterValues = indexedInputs.map((input) => (
+      options.indexedFilters && input.name in options.indexedFilters
+        ? options.indexedFilters[input.name]
+        : null
+    ));
+
+    const filterFactory = (contract as any).filters?.[eventName];
+    const filter = filterFactory ? filterFactory(...filterValues) : eventName;
+
+    const listener = async (...listenerArgs: unknown[]) => {
+      const eventPayload = listenerArgs[listenerArgs.length - 1];
+      const values = listenerArgs.slice(0, eventFragment.inputs.length);
+      const args: Record<string, unknown> = {};
+
+      eventFragment.inputs.forEach((input, index) => {
+        args[input.name || String(index)] = values[index];
+      });
+
+      await callback({
+        name: eventName,
+        args,
+        values,
+        log: (eventPayload as any)?.log ?? eventPayload,
+      });
+    };
+
+    const subscribe = async () => {
+      await (contract as any).on(filter, listener);
+    };
+    const unsubscribe = () => {
+      (contract as any).off(filter, listener);
+    };
+    const resubscribe = async () => {
+      unsubscribe();
+      await new Promise((resolve) => setTimeout(resolve, options.reconnectDelayMs ?? 1000));
+      await subscribe();
+    };
+
+    subscribe();
+
+    if (options.autoReconnect !== false) {
+      const provider = (contract.runner as any)?.provider ?? (contract as any).provider;
+      const websocket = provider?.websocket ?? provider?._websocket;
+      if (websocket?.addEventListener) {
+        websocket.addEventListener("close", resubscribe);
+      } else if (websocket?.on) {
+        websocket.on("close", resubscribe);
+      } else if (provider?.on) {
+        provider.on("disconnect", resubscribe);
+      }
+    }
+
+    return { unsubscribe, resubscribe };
   }
 
   async getOpenTasks(): Promise<any[]> {
