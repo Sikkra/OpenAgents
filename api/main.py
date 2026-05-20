@@ -1,13 +1,52 @@
+import os
+
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 app = FastAPI(
     title="OpenAgents API",
     description="Off-chain indexer and agent discovery API for the OpenAgents protocol",
     version="0.1.0",
 )
+
+
+def _csv_env(name: str) -> list[str]:
+    return [
+        item.strip()
+        for item in os.getenv(name, "").split(",")
+        if item.strip()
+    ]
+
+
+def _is_development() -> bool:
+    env = os.getenv("APP_ENV") or os.getenv("ENVIRONMENT") or "production"
+    return env.lower() in {"dev", "development", "local", "test"}
+
+
+def _cors_config() -> dict:
+    origins = _csv_env("ALLOWED_ORIGINS")
+    allow_any_origin = "*" in origins and _is_development()
+    if "*" in origins and not allow_any_origin:
+        origins = [origin for origin in origins if origin != "*"]
+
+    return {
+        "allow_origins": [] if allow_any_origin else origins,
+        "allow_origin_regex": ".*" if allow_any_origin else None,
+        "allow_credentials": True,
+        "allow_methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Authorization", "Content-Type", "X-API-Key"],
+        "max_age": 600,
+    }
+
+
+app.add_middleware(CORSMiddleware, **_cors_config())
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class AgentResponse(BaseModel):
@@ -108,5 +147,5 @@ async def health():
         "status": "ok",
         "agents_indexed": len(agents_cache),
         "tasks_indexed": len(tasks_cache),
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": _utcnow().isoformat(),
     }
