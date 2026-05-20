@@ -20,6 +20,7 @@ contract AgentRegistry is Ownable {
 
     uint256 public registrationFee;
     uint256 public minReputation;
+    uint256 public constant MAX_BATCH_SIZE = 50;
 
     event AgentRegistered(bytes32 indexed agentId, address indexed owner, string name);
     event AgentDeactivated(bytes32 indexed agentId);
@@ -32,14 +33,38 @@ contract AgentRegistry is Ownable {
 
     function registerAgent(string calldata name, string calldata endpoint) external payable returns (bytes32) {
         require(msg.value >= registrationFee, "Insufficient fee");
+        return _registerAgent(msg.sender, name, endpoint);
+    }
+
+    function batchRegister(
+        string[] calldata names,
+        string[] calldata endpoints
+    ) external payable returns (bytes32[] memory registeredIds) {
+        require(names.length == endpoints.length, "Length mismatch");
+        require(names.length > 0 && names.length <= MAX_BATCH_SIZE, "Invalid batch size");
+        require(msg.value >= registrationFee * names.length, "Insufficient fee");
+
+        registeredIds = new bytes32[](names.length);
+        for (uint256 i = 0; i < names.length; i++) {
+            registeredIds[i] = _registerAgent(msg.sender, names[i], endpoints[i]);
+        }
+    }
+
+    function _registerAgent(
+        address agentOwner,
+        string calldata name,
+        string calldata endpoint
+    ) internal returns (bytes32) {
         require(bytes(name).length > 0 && bytes(name).length <= 64, "Invalid name");
 
-        bytes32 agentId = keccak256(abi.encodePacked(msg.sender, name, block.timestamp));
+        bytes32 agentId = keccak256(
+            abi.encodePacked(agentOwner, name, endpoint, block.timestamp, agentIds.length)
+        );
 
         require(agents[agentId].registeredAt == 0, "Agent exists");
 
         agents[agentId] = Agent({
-            owner: msg.sender,
+            owner: agentOwner,
             name: name,
             endpoint: endpoint,
             reputation: 100,
@@ -48,10 +73,10 @@ contract AgentRegistry is Ownable {
             active: true
         });
 
-        ownerAgents[msg.sender].push(agentId);
+        ownerAgents[agentOwner].push(agentId);
         agentIds.push(agentId);
 
-        emit AgentRegistered(agentId, msg.sender, name);
+        emit AgentRegistered(agentId, agentOwner, name);
         return agentId;
     }
 
