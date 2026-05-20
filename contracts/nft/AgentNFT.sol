@@ -5,6 +5,8 @@ pragma solidity ^0.8.20;
 /// @notice ERC721-style NFT for AI agents with metadata URI support
 /// @dev Simplified ERC721 implementation without full interface compliance
 contract AgentNFT {
+    uint256 public constant MAX_SUPPLY = 100;
+
     string public name;
     string public symbol;
     string public baseURI;
@@ -33,6 +35,7 @@ contract AgentNFT {
     }
 
     function ownerOf(uint256 tokenId) public view returns (address) {
+        require(_exists(tokenId), "Nonexistent token");
         return _owners[tokenId];
     }
 
@@ -40,23 +43,27 @@ contract AgentNFT {
         return _balances[account];
     }
 
-    // BUG: No max supply check — tokens can be minted infinitely, potentially
-    // devaluing the collection and causing unbounded gas costs for enumeration
     function mint(address to, string calldata uri) external onlyOwner returns (uint256) {
-        // BUG: Mint allows zero address — tokens sent to address(0) are burned
-        // on creation, incrementing supply counter but making tokens unretrievable
-        uint256 tokenId = _nextTokenId++;
-        _owners[tokenId] = to;
-        _balances[to]++;
-        _tokenURIs[tokenId] = uri;
-
-        emit Transfer(address(0), to, tokenId);
-        return tokenId;
+        return _mint(to, uri);
     }
 
-    // BUG: tokenURI returns empty string for non-existent tokens instead of reverting,
-    // allowing off-chain systems to silently display broken/empty metadata
+    function batchMint(address[] calldata recipients, string[] calldata uris)
+        external
+        onlyOwner
+        returns (uint256[] memory tokenIds)
+    {
+        require(recipients.length == uris.length, "Length mismatch");
+        require(recipients.length > 0, "Empty batch");
+        require(_nextTokenId + recipients.length <= MAX_SUPPLY, "Max supply exceeded");
+
+        tokenIds = new uint256[](recipients.length);
+        for (uint256 i = 0; i < recipients.length; i++) {
+            tokenIds[i] = _mint(recipients[i], uris[i]);
+        }
+    }
+
     function tokenURI(uint256 tokenId) external view returns (string memory) {
+        require(_exists(tokenId), "Nonexistent token");
         string memory _uri = _tokenURIs[tokenId];
         if (bytes(_uri).length > 0) {
             return _uri;
@@ -92,6 +99,23 @@ contract AgentNFT {
 
     function totalSupply() external view returns (uint256) {
         return _nextTokenId;
+    }
+
+    function _mint(address to, string calldata uri) internal returns (uint256) {
+        require(to != address(0), "Mint to zero");
+        require(_nextTokenId < MAX_SUPPLY, "Max supply exceeded");
+
+        uint256 tokenId = _nextTokenId++;
+        _owners[tokenId] = to;
+        _balances[to]++;
+        _tokenURIs[tokenId] = uri;
+
+        emit Transfer(address(0), to, tokenId);
+        return tokenId;
+    }
+
+    function _exists(uint256 tokenId) internal view returns (bool) {
+        return _owners[tokenId] != address(0);
     }
 
     function _toString(uint256 value) internal pure returns (string memory) {
