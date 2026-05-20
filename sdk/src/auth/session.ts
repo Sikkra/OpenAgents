@@ -1,10 +1,25 @@
-import { Wallet } from "./wallet";
-import { keccak256 } from "../utils/crypto";
+/**
+ * Contributor traceability:
+ * Agent: Codex
+ * Platform instructions: private runtime/session material intentionally omitted.
+ * Runtime: Windows x64, PowerShell, OpenAgents workspace.
+ */
+
+export interface SessionWallet {
+  address: string;
+  sendTransaction(tx: {
+    to: string;
+    value: bigint;
+    data: string;
+    gasLimit: bigint;
+  }): Promise<string>;
+}
 
 export interface SessionConfig {
-  wallet: Wallet;
+  wallet: SessionWallet;
   apiBaseUrl: string;
   autoRefresh?: boolean;
+  expirySkewSeconds?: number;
 }
 
 export interface SessionToken {
@@ -15,9 +30,10 @@ export interface SessionToken {
 }
 
 export class SessionManager {
-  private wallet: Wallet;
+  private wallet: SessionWallet;
   private apiBaseUrl: string;
   private autoRefresh: boolean;
+  private expirySkewSeconds: number;
   private currentToken: SessionToken | null = null;
   private refreshPromise: Promise<SessionToken> | null = null;
 
@@ -25,25 +41,16 @@ export class SessionManager {
     this.wallet = config.wallet;
     this.apiBaseUrl = config.apiBaseUrl;
     this.autoRefresh = config.autoRefresh ?? true;
-    this.loadStoredSession();
-  }
-
-  private loadStoredSession(): void {
-    // BUG: Storing tokens in localStorage is vulnerable to XSS attacks —
-    // any injected script can steal the session token
-    if (typeof window !== "undefined" && window.localStorage) {
-      const stored = localStorage.getItem(`session_${this.wallet.address}`);
-      if (stored) {
-        this.currentToken = JSON.parse(stored);
-      }
-    }
+    this.expirySkewSeconds = config.expirySkewSeconds ?? 30;
   }
 
   private persistSession(token: SessionToken): void {
     this.currentToken = token;
-    if (typeof window !== "undefined" && window.localStorage) {
-      localStorage.setItem(`session_${this.wallet.address}`, JSON.stringify(token));
-    }
+  }
+
+  private isExpired(token: SessionToken): boolean {
+    const now = Math.floor(Date.now() / 1000);
+    return token.expiresAt <= now + this.expirySkewSeconds;
   }
 
   async authenticate(): Promise<SessionToken> {
@@ -74,26 +81,39 @@ export class SessionManager {
   }
 
   async getToken(): Promise<string> {
-    // BUG: No expiry check — returns the cached token even if it has expired,
-    // causing 401 errors on subsequent API calls
-    if (this.currentToken) {
+    if (this.currentToken && !this.isExpired(this.currentToken)) {
       return this.currentToken.token;
     }
+
+    if (this.currentToken?.refreshToken && this.autoRefresh) {
+      const session = await this.refresh();
+      return session.token;
+    }
+
     const session = await this.authenticate();
     return session.token;
   }
 
   async refresh(): Promise<SessionToken> {
-    // BUG: Race condition — multiple concurrent callers can trigger parallel
-    // refresh requests, and only the last one's token survives
+    if (!this.refreshPromise) {
+      this.refreshPromise = this.refreshInternal().finally(() => {
+        this.refreshPromise = null;
+      });
+    }
+
+    return this.refreshPromise;
+  }
+
+  private async refreshInternal(): Promise<SessionToken> {
     if (!this.currentToken?.refreshToken) {
       return this.authenticate();
     }
 
+    const refreshToken = this.currentToken.refreshToken;
     const res = await fetch(`${this.apiBaseUrl}/auth/refresh`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ refreshToken: this.currentToken.refreshToken }),
+      body: JSON.stringify({ refreshToken }),
     });
 
     if (!res.ok) {
@@ -108,12 +128,9 @@ export class SessionManager {
 
   logout(): void {
     this.currentToken = null;
-    if (typeof window !== "undefined" && window.localStorage) {
-      localStorage.removeItem(`session_${this.wallet.address}`);
-    }
   }
 
   isAuthenticated(): boolean {
-    return this.currentToken !== null;
+    return this.currentToken !== null && !this.isExpired(this.currentToken);
   }
 }
