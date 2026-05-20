@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// @title MultiTokenStaking
 /// @notice Allows users to stake multiple ERC20 tokens across different pools,
@@ -32,15 +33,16 @@ contract MultiTokenStaking is Ownable, ReentrancyGuard {
 
     PoolInfo[] public poolInfo;
     mapping(uint256 => mapping(address => UserInfo)) public userInfo;
+    mapping(address => bool) public poolExists;
 
     event PoolAdded(uint256 indexed pid, address token, uint256 allocPoint);
+    event PoolAllocPointUpdated(uint256 indexed pid, uint256 oldAllocPoint, uint256 newAllocPoint);
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
     event Harvest(address indexed user, uint256 indexed pid, uint256 amount);
 
-    // BUG: Missing zero-address validation — rewardToken can be set to address(0),
-    // causing all reward transfers to silently burn tokens or revert unpredictably.
     constructor(address _rewardToken, uint256 _rewardPerSecond) Ownable(msg.sender) {
+        require(_rewardToken != address(0), "MultiStaking: zero reward token");
         rewardToken = IERC20(_rewardToken);
         rewardPerSecond = _rewardPerSecond;
     }
@@ -48,11 +50,13 @@ contract MultiTokenStaking is Ownable, ReentrancyGuard {
     /// @notice Add a new staking pool.
     /// @param _allocPoint Allocation weight for reward distribution.
     /// @param _stakeToken The ERC20 token to be staked in this pool.
-    // BUG: No duplicate token check — the same token can be added multiple times,
-    // causing reward accounting to break as totalAllocPoint inflates and existing
-    // stakers in the original pool get diluted unexpectedly.
     function addPool(uint256 _allocPoint, address _stakeToken) external onlyOwner {
+        require(_stakeToken != address(0), "MultiStaking: zero stake token");
+        require(_allocPoint > 0, "MultiStaking: zero alloc");
+        require(!poolExists[_stakeToken], "MultiStaking: duplicate pool");
+
         totalAllocPoint += _allocPoint;
+        poolExists[_stakeToken] = true;
         poolInfo.push(PoolInfo({
             stakeToken: IERC20(_stakeToken),
             allocPoint: _allocPoint,
@@ -61,6 +65,18 @@ contract MultiTokenStaking is Ownable, ReentrancyGuard {
             totalStaked: 0
         }));
         emit PoolAdded(poolInfo.length - 1, _stakeToken, _allocPoint);
+    }
+
+    function updatePoolAllocPoint(uint256 pid, uint256 newAllocPoint) external onlyOwner {
+        require(newAllocPoint > 0, "MultiStaking: zero alloc");
+        updatePool(pid);
+
+        PoolInfo storage pool = poolInfo[pid];
+        uint256 oldAllocPoint = pool.allocPoint;
+        totalAllocPoint = totalAllocPoint - oldAllocPoint + newAllocPoint;
+        pool.allocPoint = newAllocPoint;
+
+        emit PoolAllocPointUpdated(pid, oldAllocPoint, newAllocPoint);
     }
 
     /// @notice Update reward variables for a given pool.
@@ -74,12 +90,8 @@ contract MultiTokenStaking is Ownable, ReentrancyGuard {
             return;
         }
 
-        uint256 elapsed = block.timestamp - pool.lastRewardTime;
-        // BUG: Reward calculation can overflow for large elapsed * rewardPerSecond * allocPoint
-        // values. With high rewardPerSecond (e.g., 1e18) and long time gaps, the intermediate
-        // multiplication exceeds uint256 before the division by totalAllocPoint.
-        uint256 reward = elapsed * rewardPerSecond * pool.allocPoint / totalAllocPoint;
-        pool.accRewardPerShare += reward * 1e12 / pool.totalStaked;
+        uint256 reward = _poolReward(pool);
+        pool.accRewardPerShare += Math.mulDiv(reward, 1e12, pool.totalStaked);
         pool.lastRewardTime = block.timestamp;
     }
 
@@ -92,7 +104,7 @@ contract MultiTokenStaking is Ownable, ReentrancyGuard {
         updatePool(pid);
 
         if (user.amount > 0) {
-            uint256 pending = user.amount * pool.accRewardPerShare / 1e12 - user.rewardDebt;
+            uint256 pending = _pending(user.amount, pool.accRewardPerShare, user.rewardDebt);
             if (pending > 0) {
                 rewardToken.safeTransfer(msg.sender, pending);
                 emit Harvest(msg.sender, pid, pending);
@@ -104,7 +116,7 @@ contract MultiTokenStaking is Ownable, ReentrancyGuard {
             user.amount += amount;
             pool.totalStaked += amount;
         }
-        user.rewardDebt = user.amount * pool.accRewardPerShare / 1e12;
+        user.rewardDebt = _rewardDebt(user.amount, pool.accRewardPerShare);
         emit Deposit(msg.sender, pid, amount);
     }
 
@@ -117,7 +129,7 @@ contract MultiTokenStaking is Ownable, ReentrancyGuard {
         require(user.amount >= amount, "MultiStaking: insufficient balance");
         updatePool(pid);
 
-        uint256 pending = user.amount * pool.accRewardPerShare / 1e12 - user.rewardDebt;
+        uint256 pending = _pending(user.amount, pool.accRewardPerShare, user.rewardDebt);
         if (pending > 0) {
             rewardToken.safeTransfer(msg.sender, pending);
             emit Harvest(msg.sender, pid, pending);
@@ -128,7 +140,7 @@ contract MultiTokenStaking is Ownable, ReentrancyGuard {
             pool.totalStaked -= amount;
             pool.stakeToken.safeTransfer(msg.sender, amount);
         }
-        user.rewardDebt = user.amount * pool.accRewardPerShare / 1e12;
+        user.rewardDebt = _rewardDebt(user.amount, pool.accRewardPerShare);
         emit Withdraw(msg.sender, pid, amount);
     }
 
@@ -138,10 +150,23 @@ contract MultiTokenStaking is Ownable, ReentrancyGuard {
         UserInfo memory user = userInfo[pid][_user];
         uint256 accRewardPerShare = pool.accRewardPerShare;
         if (block.timestamp > pool.lastRewardTime && pool.totalStaked > 0) {
-            uint256 elapsed = block.timestamp - pool.lastRewardTime;
-            uint256 reward = elapsed * rewardPerSecond * pool.allocPoint / totalAllocPoint;
-            accRewardPerShare += reward * 1e12 / pool.totalStaked;
+            uint256 reward = _poolReward(pool);
+            accRewardPerShare += Math.mulDiv(reward, 1e12, pool.totalStaked);
         }
-        return user.amount * accRewardPerShare / 1e12 - user.rewardDebt;
+        return _pending(user.amount, accRewardPerShare, user.rewardDebt);
+    }
+
+    function _poolReward(PoolInfo memory pool) internal view returns (uint256) {
+        uint256 elapsed = block.timestamp - pool.lastRewardTime;
+        uint256 timeWeightedReward = Math.mulDiv(elapsed, rewardPerSecond, totalAllocPoint);
+        return Math.mulDiv(timeWeightedReward, pool.allocPoint, 1);
+    }
+
+    function _rewardDebt(uint256 amount, uint256 accRewardPerShare) internal pure returns (uint256) {
+        return Math.mulDiv(amount, accRewardPerShare, 1e12);
+    }
+
+    function _pending(uint256 amount, uint256 accRewardPerShare, uint256 rewardDebt) internal pure returns (uint256) {
+        return _rewardDebt(amount, accRewardPerShare) - rewardDebt;
     }
 }
