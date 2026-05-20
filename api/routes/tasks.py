@@ -1,16 +1,30 @@
+# Contributor: sikkra-codex-task-status; platform instructions: private platform/session initialization text intentionally omitted; env: windows/x64/C:\Users\Ben/D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents/powershell.
+
 """Task management endpoints for bounty assignments."""
+
+from datetime import datetime
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime
 
-from ..models.database import get_db, Task
 from ..middleware.auth import get_current_user
+from ..models.database import Task, get_db
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
-VALID_STATUSES = {"open", "assigned", "in_progress", "review", "completed", "cancelled"}
+VALID_STATUSES = {"open", "assigned", "in_progress", "review", "completed", "disputed", "cancelled", "expired"}
+TERMINAL_STATUSES = {"completed", "cancelled", "expired"}
+VALID_TRANSITIONS = {
+    "open": {"assigned", "cancelled"},
+    "assigned": {"in_progress", "review", "completed", "disputed", "cancelled"},
+    "in_progress": {"review", "completed", "disputed", "cancelled"},
+    "review": {"completed", "disputed", "cancelled"},
+    "disputed": {"in_progress", "completed", "cancelled"},
+    "completed": set(),
+    "cancelled": set(),
+    "expired": set(),
+}
 
 
 class TaskCreate(BaseModel):
@@ -22,7 +36,31 @@ class TaskCreate(BaseModel):
 
 
 class TaskStatusUpdate(BaseModel):
-    status: str  # BUG: Not validated against VALID_STATUSES enum — any string accepted
+    status: str
+
+
+def _same_user_id(left, right) -> bool:
+    return str(left) == str(right)
+
+
+def _expire_if_deadline_passed(task: Task, now: Optional[datetime] = None) -> bool:
+    now = now or datetime.utcnow()
+    if task.deadline and task.deadline < now and task.status not in TERMINAL_STATUSES:
+        task.status = "expired"
+        task.updated_at = now
+        return True
+    return False
+
+
+def _validate_status_transition(current_status: str, next_status: str):
+    if next_status not in VALID_STATUSES:
+        raise HTTPException(status_code=400, detail="Invalid task status")
+    allowed = VALID_TRANSITIONS.get(current_status, set())
+    if next_status not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot transition task from {current_status} to {next_status}",
+        )
 
 
 @router.post("/")
@@ -48,17 +86,19 @@ async def list_tasks(
     status: Optional[str] = None,
     creator: Optional[str] = None,
     skip: int = Query(0, ge=0),
-    # BUG: No upper bound on limit — clients can request millions of rows,
-    # causing DB strain and potential OOM
-    limit: int = Query(50, ge=1),
+    limit: int = Query(50, ge=1, le=100),
     db=Depends(get_db),
 ):
     query = db.query(Task)
-    if status:
-        query = query.filter(Task.status == status)
     if creator:
         query = query.filter(Task.creator_id == creator)
-    return query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    tasks = query.order_by(Task.created_at.desc()).offset(skip).limit(limit).all()
+    changed = any(_expire_if_deadline_passed(task) for task in tasks)
+    if changed:
+        db.commit()
+    if status:
+        tasks = [task for task in tasks if task.status == status]
+    return tasks
 
 
 @router.get("/{task_id}")
@@ -66,6 +106,8 @@ async def get_task(task_id: int, db=Depends(get_db)):
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    if _expire_if_deadline_passed(task):
+        db.commit()
     return task
 
 
@@ -80,9 +122,15 @@ async def update_task_status(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # BUG: Creator can mark their own task as completed — should require
-    # a third party or the assignee to confirm completion
-    if task.creator_id != user["id"]:
+    if _expire_if_deadline_passed(task):
+        db.commit()
+        raise HTTPException(status_code=400, detail="Task deadline has expired")
+
+    _validate_status_transition(task.status, update.status)
+    if update.status == "completed":
+        if _same_user_id(task.creator_id, user["id"]):
+            raise HTTPException(status_code=403, detail="Task creator cannot complete own task")
+    elif not _same_user_id(task.creator_id, user["id"]):
         raise HTTPException(status_code=403, detail="Only the creator can update status")
 
     task.status = update.status
