@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: MIT
+// @contributor-info openai-codex-wallet-7
+// @platform Private platform/session initialization text intentionally omitted.
+// @env os=windows; arch=x64; home_dir=C:\Users\Ben; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+// @timestamp 2026-05-20T08:12:28Z
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -14,12 +18,14 @@ contract StakingRewards is ReentrancyGuard {
     IERC20 public immutable stakingToken;
     IERC20 public immutable rewardsToken;
     address public owner;
+    address public rewardsDistributor;
 
     uint256 public periodFinish;
     uint256 public rewardRate;
     uint256 public rewardsDuration = 7 days;
     uint256 public lastUpdateTime;
     uint256 public rewardPerTokenStored;
+    uint256 public constant RATE_PRECISION = 1e18;
 
     mapping(address => uint256) public userRewardPerTokenPaid;
     mapping(address => uint256) public rewards;
@@ -31,6 +37,7 @@ contract StakingRewards is ReentrancyGuard {
     event Withdrawn(address indexed user, uint256 amount);
     event RewardPaid(address indexed user, uint256 reward);
     event RewardAdded(uint256 reward);
+    event RewardsDistributorUpdated(address indexed distributor);
 
     modifier updateReward(address account) {
         rewardPerTokenStored = rewardPerToken();
@@ -46,6 +53,12 @@ contract StakingRewards is ReentrancyGuard {
         stakingToken = IERC20(_stakingToken);
         rewardsToken = IERC20(_rewardsToken);
         owner = msg.sender;
+        rewardsDistributor = msg.sender;
+    }
+
+    modifier onlyRewardsDistributor() {
+        require(msg.sender == rewardsDistributor, "Not distributor");
+        _;
     }
 
     function totalSupply() external view returns (uint256) {
@@ -66,11 +79,8 @@ contract StakingRewards is ReentrancyGuard {
         if (_totalSupply == 0) {
             return rewardPerTokenStored;
         }
-        // BUG: Uses block.timestamp directly instead of lastTimeRewardApplicable().
-        // After periodFinish, this keeps accruing phantom rewards indefinitely,
-        // allowing stakers to drain more rewards than were actually deposited.
         return rewardPerTokenStored + (
-            (block.timestamp - lastUpdateTime) * rewardRate * 1e18 / _totalSupply
+            ((lastTimeRewardApplicable() - lastUpdateTime) * rewardRate) / _totalSupply
         );
     }
 
@@ -110,20 +120,24 @@ contract StakingRewards is ReentrancyGuard {
         }
     }
 
+    /// @notice Set the only account allowed to notify reward distributions.
+    function setRewardsDistributor(address distributor) external {
+        require(msg.sender == owner, "Not owner");
+        require(distributor != address(0), "Zero distributor");
+        rewardsDistributor = distributor;
+        emit RewardsDistributorUpdated(distributor);
+    }
+
     /// @notice Notify the contract of a new reward amount to distribute.
     /// @param reward Total reward tokens to distribute over the duration.
-    // BUG: No access control — anyone can call notifyRewardAmount. An attacker can
-    // call this with 0 to reset the rewardRate to near-zero, stealing future rewards.
-    function notifyRewardAmount(uint256 reward) external updateReward(address(0)) {
+    function notifyRewardAmount(uint256 reward) external onlyRewardsDistributor updateReward(address(0)) {
+        require(reward > 0, "Reward zero");
         if (block.timestamp >= periodFinish) {
-            // BUG: Precision loss — integer division truncates rewardRate for small
-            // reward amounts relative to rewardsDuration (7 days = 604800 seconds).
-            // E.g., 500000 wei / 604800 = 0, meaning all rewards are lost.
-            rewardRate = reward / rewardsDuration;
+            rewardRate = (reward * RATE_PRECISION) / rewardsDuration;
         } else {
             uint256 remaining = periodFinish - block.timestamp;
-            uint256 leftover = remaining * rewardRate;
-            rewardRate = (reward + leftover) / rewardsDuration;
+            uint256 leftover = (remaining * rewardRate) / RATE_PRECISION;
+            rewardRate = ((reward + leftover) * RATE_PRECISION) / rewardsDuration;
         }
 
         lastUpdateTime = block.timestamp;
