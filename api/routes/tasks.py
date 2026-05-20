@@ -7,10 +7,11 @@ from datetime import datetime
 
 from ..models.database import get_db, Task
 from ..middleware.auth import get_current_user
+from .webhooks import WEBHOOK_EVENTS, deliver_task_webhooks
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
-VALID_STATUSES = {"open", "assigned", "in_progress", "review", "completed", "cancelled"}
+VALID_STATUSES = {"open", "assigned", "in_progress", "review", "completed", "disputed", "cancelled"}
 
 
 class TaskCreate(BaseModel):
@@ -22,7 +23,7 @@ class TaskCreate(BaseModel):
 
 
 class TaskStatusUpdate(BaseModel):
-    status: str  # BUG: Not validated against VALID_STATUSES enum — any string accepted
+    status: str  # BUG: Not validated against VALID_STATUSES enum - any string accepted
 
 
 @router.post("/")
@@ -40,6 +41,9 @@ async def create_task(task: TaskCreate, user=Depends(get_current_user), db=Depen
     db.add(new_task)
     db.commit()
     db.refresh(new_task)
+    deliver_task_webhooks(db, new_task, "created")
+    if new_task.agent_id is not None:
+        deliver_task_webhooks(db, new_task, "assigned")
     return {"id": new_task.id, "status": new_task.status}
 
 
@@ -48,7 +52,7 @@ async def list_tasks(
     status: Optional[str] = None,
     creator: Optional[str] = None,
     skip: int = Query(0, ge=0),
-    # BUG: No upper bound on limit — clients can request millions of rows,
+    # BUG: No upper bound on limit - clients can request millions of rows,
     # causing DB strain and potential OOM
     limit: int = Query(50, ge=1),
     db=Depends(get_db),
@@ -80,7 +84,7 @@ async def update_task_status(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # BUG: Creator can mark their own task as completed — should require
+    # BUG: Creator can mark their own task as completed - should require
     # a third party or the assignee to confirm completion
     if task.creator_id != user["id"]:
         raise HTTPException(status_code=403, detail="Only the creator can update status")
@@ -88,6 +92,8 @@ async def update_task_status(
     task.status = update.status
     task.updated_at = datetime.utcnow()
     db.commit()
+    if update.status in WEBHOOK_EVENTS:
+        deliver_task_webhooks(db, task, update.status)
     return {"id": task.id, "status": task.status}
 
 
