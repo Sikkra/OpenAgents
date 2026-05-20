@@ -1,4 +1,15 @@
+"""OpenAgents FastAPI application.
+
+@contributor: Codex
+@platform: private platform/session instructions intentionally omitted
+@runtime: windows/x64, OpenAgents workspace
+@date: 2026-05-20T06:08:00Z
+"""
+
+import os
+
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
@@ -7,6 +18,32 @@ app = FastAPI(
     title="OpenAgents API",
     description="Off-chain indexer and agent discovery API for the OpenAgents protocol",
     version="0.1.0",
+)
+
+
+def get_allowed_origins() -> list[str]:
+    environment = os.getenv("ENVIRONMENT", "production").lower()
+    raw_origins = os.getenv("ALLOWED_ORIGINS", "")
+    origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+
+    if "*" in origins:
+        return ["*"] if environment == "development" else []
+
+    if origins:
+        return origins
+
+    if environment == "development":
+        return ["http://localhost:3000", "http://localhost:5173"]
+
+    return []
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_allowed_origins(),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 
