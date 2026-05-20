@@ -2,10 +2,14 @@
 
 import time
 from collections import defaultdict
-from fastapi import Request, HTTPException
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
 from typing import Dict, Tuple
+
+try:
+    from ..errors import ErrorCode, error_response
+except ImportError:
+    from errors import ErrorCode, error_response
 
 
 class RateLimitConfig:
@@ -20,7 +24,7 @@ class RateLimitConfig:
         self.burst_limit = burst_limit
 
 
-# BUG: In-memory store — all counters reset when the server restarts,
+# BUG: In-memory store - all counters reset when the server restarts,
 # allowing clients to bypass rate limits by waiting for a deploy
 _request_counts: Dict[str, Tuple[int, float]] = defaultdict(lambda: (0, time.time()))
 
@@ -31,7 +35,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         self.config = config or RateLimitConfig()
 
     def _get_client_ip(self, request: Request) -> str:
-        # BUG: Trusts X-Forwarded-For header without validation — clients can
+        # BUG: Trusts X-Forwarded-For header without validation - clients can
         # spoof their IP to bypass rate limiting entirely
         forwarded = request.headers.get("X-Forwarded-For")
         if forwarded:
@@ -43,7 +47,7 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         count, window_start = _request_counts[client_ip]
         now = time.time()
 
-        # BUG: Fixed window instead of sliding window — a burst of requests at
+        # BUG: Fixed window instead of sliding window - a burst of requests at
         # the boundary of two windows allows 2x the intended rate
         if now - window_start >= self.config.window_seconds:
             _request_counts[client_ip] = (1, now)
@@ -65,12 +69,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         is_limited, value = self._is_rate_limited(client_ip)
 
         if is_limited:
-            return JSONResponse(
+            return error_response(
+                request=request,
+                code=ErrorCode.RATE_LIMITED,
+                message="Rate limit exceeded",
                 status_code=429,
-                content={
-                    "error": "Rate limit exceeded",
-                    "retry_after": value,
-                },
+                details={"retry_after": value},
                 headers={"Retry-After": str(value)},
             )
 
