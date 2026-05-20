@@ -53,7 +53,6 @@ export class SessionManager {
       to: "0x0000000000000000000000000000000000000000",
       value: 0n,
       data: "0x",
-      gasLimit: 0n,
     });
 
     const res = await fetch(`${this.apiBaseUrl}/auth/login`, {
