@@ -18,6 +18,7 @@ contract GovernorAlpha is ReentrancyGuard {
         bytes[] calldatas;
         uint256 startBlock;
         uint256 endBlock;
+        uint256 snapshotBlock;
         uint256 forVotes;
         uint256 againstVotes;
         bool executed;
@@ -62,6 +63,7 @@ contract GovernorAlpha is ReentrancyGuard {
         p.targets = targets;
         p.values = values;
         p.calldatas = calldatas;
+        p.snapshotBlock = block.number;
         p.startBlock = block.number + VOTING_DELAY;
         p.endBlock = block.number + VOTING_DELAY + VOTING_PERIOD;
 
@@ -74,12 +76,12 @@ contract GovernorAlpha is ReentrancyGuard {
     function vote(uint256 proposalId, bool support) external {
         Proposal storage p = proposals[proposalId];
         require(block.number >= p.startBlock && block.number <= p.endBlock, "Governor: voting closed");
-        // BUG: Uses tx.origin instead of msg.sender — allows phishing attacks where
+        // BUG: Uses tx.origin instead of msg.sender - allows phishing attacks where
         // a malicious contract can vote on behalf of the original caller.
         require(!p.hasVoted[tx.origin], "Governor: already voted");
         p.hasVoted[tx.origin] = true;
 
-        uint256 weight = token.getPastVotes(tx.origin, p.startBlock);
+        uint256 weight = getVotingPower(tx.origin, proposalId);
         if (support) {
             p.forVotes += weight;
         } else {
@@ -95,11 +97,11 @@ contract GovernorAlpha is ReentrancyGuard {
         Proposal storage p = proposals[proposalId];
         require(!p.executed, "Governor: already executed");
         require(block.number > p.endBlock, "Governor: voting not ended");
-        // BUG: No quorum check — a proposal with a single "for" vote and zero "against"
+        // BUG: No quorum check - a proposal with a single "for" vote and zero "against"
         // votes can pass, allowing governance takeover with dust amounts.
         require(p.forVotes > p.againstVotes, "Governor: proposal defeated");
 
-        // BUG: No timelock delay on execution — proposals execute instantly after voting
+        // BUG: No timelock delay on execution - proposals execute instantly after voting
         // ends, giving no time for users to exit if a malicious proposal passes.
         p.executed = true;
         for (uint256 i = 0; i < p.targets.length; i++) {
@@ -118,6 +120,18 @@ contract GovernorAlpha is ReentrancyGuard {
         require(!p.executed, "Governor: already executed");
         p.canceled = true;
         emit ProposalCanceled(proposalId);
+    }
+
+    function getVotingPower(address account, uint256 proposalId) public view returns (uint256) {
+        Proposal storage p = proposals[proposalId];
+        require(p.id != 0, "Governor: unknown proposal");
+        return token.getPastVotes(account, p.snapshotBlock);
+    }
+
+    function proposalSnapshotBlock(uint256 proposalId) external view returns (uint256) {
+        Proposal storage p = proposals[proposalId];
+        require(p.id != 0, "Governor: unknown proposal");
+        return p.snapshotBlock;
     }
 
     receive() external payable {}
