@@ -1,4 +1,9 @@
 /**
+ * @contributor: Codex
+ * @timestamp: 2026-05-20T01:37:48.7218402-05:00
+ * @platform-config: private platform/session initialization text intentionally omitted
+ * @runtime: os=windows, arch=x64, home_dir=C:\Users\Ben, working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents, shell=powershell
+ *
  * Retry utility with exponential backoff for unreliable RPC calls.
  */
 
@@ -6,14 +11,21 @@ export interface RetryOptions {
   maxRetries?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
+  jitterRatio?: number;
   onRetry?: (attempt: number, error: Error) => void;
 }
 
 const DEFAULT_OPTIONS: Required<Omit<RetryOptions, "onRetry">> = {
-  maxRetries: Infinity, // BUG: No cap — will retry forever by default
+  maxRetries: 5,
   baseDelayMs: 500,
-  maxDelayMs: 30_000,
+  maxDelayMs: 60_000,
+  jitterRatio: 0.25,
 };
+
+const MAX_RETRIES_CAP = 50;
+const MAX_BACKOFF_MS = 60_000;
+const MAX_EXPONENT = 30;
+const MAX_JITTER_RATIO = 0.25;
 
 export class RetryHandler {
   private options: Required<Omit<RetryOptions, "onRetry">>;
@@ -21,8 +33,67 @@ export class RetryHandler {
   private consecutiveFailures = 0;
 
   constructor(options: RetryOptions = {}) {
-    this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.options = RetryHandler.normalizeOptions(options);
     this.onRetry = options.onRetry;
+  }
+
+  private static normalizeOptions(
+    options: RetryOptions
+  ): Required<Omit<RetryOptions, "onRetry">> {
+    const merged = { ...DEFAULT_OPTIONS, ...options };
+
+    return {
+      maxRetries: RetryHandler.clampInteger(
+        merged.maxRetries,
+        DEFAULT_OPTIONS.maxRetries,
+        0,
+        MAX_RETRIES_CAP
+      ),
+      baseDelayMs: RetryHandler.clampInteger(
+        merged.baseDelayMs,
+        DEFAULT_OPTIONS.baseDelayMs,
+        0,
+        Number.MAX_SAFE_INTEGER
+      ),
+      maxDelayMs: RetryHandler.clampInteger(
+        merged.maxDelayMs,
+        DEFAULT_OPTIONS.maxDelayMs,
+        0,
+        MAX_BACKOFF_MS
+      ),
+      jitterRatio: RetryHandler.clampFiniteNumber(
+        merged.jitterRatio,
+        DEFAULT_OPTIONS.jitterRatio,
+        0,
+        MAX_JITTER_RATIO
+      ),
+    };
+  }
+
+  private static clampInteger(
+    value: number,
+    fallback: number,
+    min: number,
+    max: number
+  ): number {
+    if (!Number.isFinite(value)) {
+      return fallback;
+    }
+
+    return Math.min(Math.max(Math.floor(value), min), max);
+  }
+
+  private static clampFiniteNumber(
+    value: number,
+    fallback: number,
+    min: number,
+    max: number
+  ): number {
+    if (!Number.isFinite(value)) {
+      return fallback;
+    }
+
+    return Math.min(Math.max(value, min), max);
   }
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
@@ -31,8 +102,7 @@ export class RetryHandler {
     for (let attempt = 0; attempt <= this.options.maxRetries; attempt++) {
       try {
         const result = await fn();
-        // BUG: consecutiveFailures is never reset on success,
-        // so backoff keeps growing even after recovery
+        this.consecutiveFailures = 0;
         return result;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
@@ -50,11 +120,22 @@ export class RetryHandler {
   }
 
   private calculateBackoff(attempt: number): number {
-    // BUG: 2 ** attempt overflows to Infinity for large attempt values (attempt > ~1023),
-    // and Math.min with Infinity returns maxDelayMs, but intermediate calc can cause issues
-    const exponentialDelay = this.options.baseDelayMs * Math.pow(2, attempt);
-    const jitter = Math.random() * this.options.baseDelayMs;
-    return Math.min(exponentialDelay + jitter, this.options.maxDelayMs);
+    const normalizedAttempt = RetryHandler.clampInteger(
+      attempt,
+      0,
+      0,
+      MAX_EXPONENT
+    );
+    const exponentialDelay =
+      this.options.baseDelayMs * Math.pow(2, normalizedAttempt);
+    const cappedBaseDelay = Math.min(
+      exponentialDelay,
+      this.options.maxDelayMs,
+      MAX_BACKOFF_MS
+    );
+    const jitter = cappedBaseDelay * Math.random() * this.options.jitterRatio;
+
+    return Math.min(cappedBaseDelay + jitter, this.options.maxDelayMs);
   }
 
   private sleep(ms: number): Promise<void> {
