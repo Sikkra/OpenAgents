@@ -1,3 +1,8 @@
+/**
+ * @contributor-info: Codex; private platform/session initialization text intentionally omitted.
+ * @runtime: windows/x64, home_dir=C:\\Users\\Ben, working_dir=D:\\Documents\\AI Projects\\Wallet\\bounty-work\\OpenAgents, shell=powershell
+ */
+
 import { ethers } from "ethers";
 
 export interface AgentConfig {
@@ -7,6 +12,28 @@ export interface AgentConfig {
   rpcUrl: string;
   registryAddress: string;
   routerAddress: string;
+}
+
+export interface DeployContractOptions {
+  confirmations?: number;
+  overrides?: ethers.Overrides;
+}
+
+export interface DeploymentReceiptMetadata {
+  address: string;
+  transactionHash: string;
+  gasUsed: bigint;
+  blockNumber: number | null;
+  confirmations: number;
+}
+
+export interface DeploymentResult<TContract extends ethers.BaseContract = ethers.Contract> {
+  contract: TContract;
+  address: string;
+  transactionHash: string;
+  gasUsed: bigint;
+  receipt: ethers.TransactionReceipt;
+  metadata: DeploymentReceiptMetadata;
 }
 
 export class OpenAgentsSDK {
@@ -58,6 +85,45 @@ export class OpenAgentsSDK {
       ethers.toUtf8Bytes(result)
     );
     await tx.wait();
+  }
+
+  async deployContract<TContract extends ethers.BaseContract = ethers.Contract>(
+    abi: ethers.InterfaceAbi,
+    bytecode: ethers.BytesLike | string,
+    args: unknown[] = [],
+    options: DeployContractOptions = {}
+  ): Promise<DeploymentResult<TContract>> {
+    const factory = new ethers.ContractFactory(abi, bytecode, this.signer);
+    const deployArgs = options.overrides ? [...args, options.overrides] : args;
+    const contract = await factory.deploy(...deployArgs);
+    await contract.waitForDeployment();
+
+    const deploymentTx = contract.deploymentTransaction();
+    if (!deploymentTx) {
+      throw new Error("Deployment transaction is unavailable");
+    }
+
+    const confirmations = options.confirmations ?? 1;
+    const receipt = await deploymentTx.wait(confirmations);
+    if (!receipt) {
+      throw new Error("Deployment receipt is unavailable");
+    }
+
+    const address = await contract.getAddress();
+    return {
+      contract: contract as TContract,
+      address,
+      transactionHash: deploymentTx.hash,
+      gasUsed: receipt.gasUsed,
+      receipt,
+      metadata: {
+        address,
+        transactionHash: deploymentTx.hash,
+        gasUsed: receipt.gasUsed,
+        blockNumber: receipt.blockNumber ?? null,
+        confirmations,
+      },
+    };
   }
 
   async getOpenTasks(): Promise<any[]> {
