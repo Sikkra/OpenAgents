@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: MIT
+// @contributor openai-codex-wallet-95
+// @platform Private platform/session initialization text intentionally omitted.
+// @env os=windows; arch=x64; home_dir=C:\Users\Ben; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+// @timestamp 2026-05-20T08:07:52Z
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -23,6 +27,8 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
     IERC20 public immutable asset;
     uint256 public totalShares;
     uint256 public totalDeposited;
+    uint256 public constant BPS_DENOMINATOR = 10_000;
+    uint256 public constant MAX_PRICE_DEVIATION_BPS = 500;
     mapping(address => uint256) public shares;
 
     Strategy[] public strategies;
@@ -38,18 +44,28 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
 
     /// @notice Deposit tokens into the vault and receive shares.
     /// @param amount Amount of base token to deposit.
+    /// @param minShares Minimum acceptable shares to receive.
     /// @return sharesMinted Number of shares issued to the depositor.
-    // BUG: No slippage check on deposit — the share price can be manipulated via
-    // donation attacks (sending tokens directly to the vault) between the user's
-    // approval and deposit, causing them to receive far fewer shares than expected.
+    function deposit(uint256 amount, uint256 minShares) external nonReentrant returns (uint256 sharesMinted) {
+        sharesMinted = _deposit(amount, minShares);
+    }
+
+    /// @notice Backwards-compatible deposit helper with no caller-specified slippage floor.
     function deposit(uint256 amount) external nonReentrant returns (uint256 sharesMinted) {
+        sharesMinted = _deposit(amount, 0);
+    }
+
+    function _deposit(uint256 amount, uint256 minShares) internal returns (uint256 sharesMinted) {
         require(amount > 0, "Vault: zero deposit");
+        _requireSaneSharePrice();
 
         if (totalShares == 0) {
             sharesMinted = amount;
         } else {
-            sharesMinted = (amount * totalShares) / totalAssets();
+            sharesMinted = (amount * totalShares) / totalDeposited;
         }
+        require(sharesMinted > 0, "Vault: zero shares minted");
+        require(sharesMinted >= minShares, "Vault: min shares");
 
         asset.safeTransferFrom(msg.sender, address(this), amount);
         totalShares += sharesMinted;
@@ -66,14 +82,11 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
         require(shareAmount > 0, "Vault: zero shares");
         require(shares[msg.sender] >= shareAmount, "Vault: insufficient shares");
 
-        // BUG: Uses balanceOf instead of internal accounting (totalDeposited + strategy gains).
-        // If tokens are donated directly to the vault or a strategy returns funds outside
-        // the normal flow, this inflates the withdrawal amount, allowing early withdrawers
-        // to drain more than their share at the expense of later users.
-        assetsReturned = (shareAmount * asset.balanceOf(address(this))) / totalShares;
+        assetsReturned = (shareAmount * totalDeposited) / totalShares;
 
         shares[msg.sender] -= shareAmount;
         totalShares -= shareAmount;
+        totalDeposited -= assetsReturned;
 
         asset.safeTransfer(msg.sender, assetsReturned);
         emit Withdraw(msg.sender, assetsReturned, shareAmount);
@@ -81,9 +94,8 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
 
     /// @notice Add a new yield strategy.
     /// @param target Address of the strategy contract.
-    // BUG: Strategy target can be zero address — allocating funds to address(0)
-    // would burn them permanently via the external call.
     function addStrategy(address target) external onlyOwner {
+        require(target != address(0), "Vault: zero strategy");
         strategies.push(Strategy({
             target: target,
             allocated: 0,
@@ -125,6 +137,22 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
     /// @notice Preview shares for a given deposit amount.
     function previewDeposit(uint256 amount) external view returns (uint256) {
         if (totalShares == 0) return amount;
-        return (amount * totalShares) / totalAssets();
+        return (amount * totalShares) / totalDeposited;
+    }
+
+    /// @notice Return true if observed assets are within the accepted accounting band.
+    function isSharePriceSane() public view returns (bool) {
+        if (totalShares == 0 || totalDeposited == 0) {
+            return true;
+        }
+
+        uint256 observedAssets = totalAssets();
+        uint256 maxAssets = totalDeposited + ((totalDeposited * MAX_PRICE_DEVIATION_BPS) / BPS_DENOMINATOR);
+        uint256 minAssets = totalDeposited - ((totalDeposited * MAX_PRICE_DEVIATION_BPS) / BPS_DENOMINATOR);
+        return observedAssets >= minAssets && observedAssets <= maxAssets;
+    }
+
+    function _requireSaneSharePrice() internal view {
+        require(isSharePriceSane(), "Vault: price deviation");
     }
 }
