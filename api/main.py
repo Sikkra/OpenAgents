@@ -1,13 +1,29 @@
-from fastapi import FastAPI, HTTPException, Query
+# @contributor openai-codex-wallet-147
+# @timestamp 2026-05-20T08:17:30Z
+# @platform Private platform/session initialization text intentionally omitted.
+# @env os=windows; arch=x64; home_dir=C:\Users\Ben; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+
+from fastapi import FastAPI, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+
+from api.errors import ERROR_CODE_DOCUMENTATION, get_request_id, register_exception_handlers
 
 app = FastAPI(
     title="OpenAgents API",
     description="Off-chain indexer and agent discovery API for the OpenAgents protocol",
     version="0.1.0",
 )
+register_exception_handlers(app)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = get_request_id(request)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 class AgentResponse(BaseModel):
@@ -42,6 +58,11 @@ class LeaderboardEntry(BaseModel):
 # In-memory store (placeholder for DB)
 agents_cache: dict = {}
 tasks_cache: dict = {}
+
+
+@app.get("/errors/codes")
+async def error_codes():
+    return {"codes": ERROR_CODE_DOCUMENTATION}
 
 
 @app.get("/agents", response_model=list[AgentResponse])

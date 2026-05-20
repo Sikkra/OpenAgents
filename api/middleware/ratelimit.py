@@ -1,11 +1,17 @@
 """Rate limiting middleware for the OpenAgents API."""
 
+# @contributor openai-codex-wallet-147
+# @timestamp 2026-05-20T08:17:30Z
+# @platform Private platform/session initialization text intentionally omitted.
+# @env os=windows; arch=x64; home_dir=C:\Users\Ben; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+
 import time
 from collections import defaultdict
-from fastapi import Request, HTTPException
+from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import JSONResponse
 from typing import Dict, Tuple
+
+from api.errors import ErrorCode, error_response
 
 
 class RateLimitConfig:
@@ -65,12 +71,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         is_limited, value = self._is_rate_limited(client_ip)
 
         if is_limited:
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "error": "Rate limit exceeded",
-                    "retry_after": value,
-                },
+            return error_response(
+                request,
+                429,
+                ErrorCode.RATE_LIMITED,
+                "Rate limit exceeded",
+                {"retry_after": value},
                 headers={"Retry-After": str(value)},
             )
 
