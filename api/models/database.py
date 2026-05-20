@@ -4,8 +4,7 @@ from sqlalchemy import (
     create_engine, Column, Integer, String, Float, Text, JSON,
     ForeignKey, DateTime, Enum as SAEnum,
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from datetime import datetime
 import os
 
@@ -42,6 +41,7 @@ class Agent(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(128), nullable=False)
     description = Column(Text, nullable=True)
+    endpoint = Column(String(2048), nullable=True)
     model_type = Column(String(32), default="gpt-4")
     config = Column(JSON, default=dict)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
