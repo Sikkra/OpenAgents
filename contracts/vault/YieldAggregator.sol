@@ -3,16 +3,17 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /// @title YieldAggregator
 /// @notice Vault that accepts deposits and allocates capital across yield strategies.
-/// @dev Implements a simplified vault pattern. Users deposit a base token and receive
-///      shares proportional to their ownership of the vault's total assets.
+/// @dev Uses internal asset accounting so direct token donations cannot manipulate share pricing.
 contract YieldAggregator is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
+
+    uint256 public constant MAX_PRICE_DEVIATION_BPS = 500;
+    uint256 private constant BPS_DENOMINATOR = 10_000;
 
     struct Strategy {
         address target;
@@ -33,23 +34,25 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
     event StrategyAllocated(uint256 indexed strategyId, uint256 amount);
 
     constructor(address _asset) Ownable(msg.sender) {
+        require(_asset != address(0), "Vault: zero asset");
         asset = IERC20(_asset);
     }
 
     /// @notice Deposit tokens into the vault and receive shares.
     /// @param amount Amount of base token to deposit.
+    /// @param minShares Minimum acceptable shares to mint.
     /// @return sharesMinted Number of shares issued to the depositor.
-    // BUG: No slippage check on deposit — the share price can be manipulated via
-    // donation attacks (sending tokens directly to the vault) between the user's
-    // approval and deposit, causing them to receive far fewer shares than expected.
-    function deposit(uint256 amount) external nonReentrant returns (uint256 sharesMinted) {
+    function deposit(uint256 amount, uint256 minShares) external nonReentrant returns (uint256 sharesMinted) {
         require(amount > 0, "Vault: zero deposit");
+        _enforcePriceSanity();
 
         if (totalShares == 0) {
             sharesMinted = amount;
         } else {
             sharesMinted = (amount * totalShares) / totalAssets();
         }
+        require(sharesMinted > 0, "Vault: zero shares");
+        require(sharesMinted >= minShares, "Vault: insufficient shares");
 
         asset.safeTransferFrom(msg.sender, address(this), amount);
         totalShares += sharesMinted;
@@ -65,15 +68,13 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
     function withdraw(uint256 shareAmount) external nonReentrant returns (uint256 assetsReturned) {
         require(shareAmount > 0, "Vault: zero shares");
         require(shares[msg.sender] >= shareAmount, "Vault: insufficient shares");
+        _enforcePriceSanity();
 
-        // BUG: Uses balanceOf instead of internal accounting (totalDeposited + strategy gains).
-        // If tokens are donated directly to the vault or a strategy returns funds outside
-        // the normal flow, this inflates the withdrawal amount, allowing early withdrawers
-        // to drain more than their share at the expense of later users.
-        assetsReturned = (shareAmount * asset.balanceOf(address(this))) / totalShares;
+        assetsReturned = (shareAmount * totalAssets()) / totalShares;
 
         shares[msg.sender] -= shareAmount;
         totalShares -= shareAmount;
+        totalDeposited -= assetsReturned;
 
         asset.safeTransfer(msg.sender, assetsReturned);
         emit Withdraw(msg.sender, assetsReturned, shareAmount);
@@ -81,9 +82,8 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
 
     /// @notice Add a new yield strategy.
     /// @param target Address of the strategy contract.
-    // BUG: Strategy target can be zero address — allocating funds to address(0)
-    // would burn them permanently via the external call.
     function addStrategy(address target) external onlyOwner {
+        require(target != address(0), "Vault: zero strategy");
         strategies.push(Strategy({
             target: target,
             allocated: 0,
@@ -111,13 +111,16 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
         strategies[strategyId].active = false;
     }
 
-    /// @notice Total assets under management (vault balance + allocated to strategies).
+    /// @notice Total assets tracked by vault accounting.
     function totalAssets() public view returns (uint256) {
+        return totalDeposited;
+    }
+
+    /// @notice Current token balance plus internally allocated strategy principal.
+    function actualManagedAssets() public view returns (uint256) {
         uint256 total = asset.balanceOf(address(this));
         for (uint256 i = 0; i < strategies.length; i++) {
-            if (strategies[i].active) {
-                total += strategies[i].allocated;
-            }
+            total += strategies[i].allocated;
         }
         return total;
     }
@@ -126,5 +129,25 @@ contract YieldAggregator is Ownable, ReentrancyGuard {
     function previewDeposit(uint256 amount) external view returns (uint256) {
         if (totalShares == 0) return amount;
         return (amount * totalShares) / totalAssets();
+    }
+
+    /// @notice Preview assets returned for a share redemption.
+    function previewWithdraw(uint256 shareAmount) external view returns (uint256) {
+        if (totalShares == 0) return 0;
+        return (shareAmount * totalAssets()) / totalShares;
+    }
+
+    function _enforcePriceSanity() internal view {
+        uint256 accounted = totalAssets();
+        if (accounted == 0) {
+            return;
+        }
+
+        uint256 actual = actualManagedAssets();
+        uint256 deviation = actual > accounted ? actual - accounted : accounted - actual;
+        require(
+            deviation * BPS_DENOMINATOR <= accounted * MAX_PRICE_DEVIATION_BPS,
+            "Vault: price deviation"
+        );
     }
 }
