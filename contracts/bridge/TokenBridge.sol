@@ -25,6 +25,15 @@ contract TokenBridge is ReentrancyGuard {
     mapping(address => bool) public isValidator;
     mapping(bytes32 => Transfer) public transfers;
     mapping(bytes32 => bool) public processedHashes;
+    mapping(address => uint256) public senderNonces;
+    mapping(address => uint256) public claimNonces;
+
+    bytes32 public constant DOMAIN_TYPEHASH = keccak256(
+        "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+    );
+    bytes32 public constant CLAIM_TYPEHASH = keccak256(
+        "BridgeClaim(uint256 chainId,address verifyingContract,address token,address recipient,uint256 amount,uint256 nonce)"
+    );
 
     event TokensLocked(bytes32 indexed transferId, address token, address sender, address recipient, uint256 amount);
     event TokensClaimed(bytes32 indexed transferId, address token, address recipient, uint256 amount);
@@ -41,6 +50,16 @@ contract TokenBridge is ReentrancyGuard {
         requiredSignatures = _requiredSignatures;
     }
 
+    function DOMAIN_SEPARATOR() public view returns (bytes32) {
+        return keccak256(abi.encode(
+            DOMAIN_TYPEHASH,
+            keccak256(bytes("OpenAgents TokenBridge")),
+            keccak256(bytes("1")),
+            block.chainid,
+            address(this)
+        ));
+    }
+
     /// @notice Lock tokens on the source chain to initiate a cross-chain transfer.
     /// @param token ERC20 token address.
     /// @param recipient Destination address on the target chain.
@@ -48,12 +67,16 @@ contract TokenBridge is ReentrancyGuard {
     function lock(address token, address recipient, uint256 amount) external nonReentrant {
         require(amount > 0, "Bridge: zero amount");
 
-        // BUG: No chainId in the hash — the same transferId can be replayed on other
-        // chains where this bridge is deployed, allowing double-claiming of tokens.
-        // BUG: No nonce or unique identifier — if the same user bridges the same token
-        // and amount to the same recipient twice, the transferId collides, overwriting
-        // the first transfer and potentially losing funds.
-        bytes32 transferId = keccak256(abi.encodePacked(token, msg.sender, recipient, amount));
+        uint256 nonce = senderNonces[msg.sender]++;
+        bytes32 transferId = keccak256(abi.encode(
+            block.chainid,
+            address(this),
+            token,
+            msg.sender,
+            recipient,
+            amount,
+            nonce
+        ));
 
         IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
 
@@ -79,8 +102,29 @@ contract TokenBridge is ReentrancyGuard {
         uint256 amount,
         bytes[] calldata signatures
     ) external nonReentrant {
-        bytes32 messageHash = keccak256(abi.encodePacked(token, recipient, amount));
-        bytes32 ethSignedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", messageHash));
+        _claim(token, recipient, amount, claimNonces[recipient], signatures);
+    }
+
+    /// @notice Claim bridged tokens with an explicit recipient nonce.
+    function claim(
+        address token,
+        address recipient,
+        uint256 amount,
+        uint256 nonce,
+        bytes[] calldata signatures
+    ) external nonReentrant {
+        _claim(token, recipient, amount, nonce, signatures);
+    }
+
+    function _claim(
+        address token,
+        address recipient,
+        uint256 amount,
+        uint256 nonce,
+        bytes[] calldata signatures
+    ) internal {
+        require(nonce == claimNonces[recipient], "Bridge: invalid nonce");
+        bytes32 messageHash = _claimHash(token, recipient, amount, nonce);
 
         require(!processedHashes[messageHash], "Bridge: already processed");
         require(signatures.length >= requiredSignatures, "Bridge: insufficient sigs");
@@ -88,10 +132,7 @@ contract TokenBridge is ReentrancyGuard {
         uint256 validSigs = 0;
         address lastSigner = address(0);
         for (uint256 i = 0; i < signatures.length; i++) {
-            address signer = _recover(ethSignedHash, signatures[i]);
-            // BUG: ecrecover returns address(0) on invalid signatures, but this is not
-            // checked. A zero-address signer that happens to be in the validator set
-            // (or collides with the default mapping value) would count as valid.
+            address signer = _recover(messageHash, signatures[i]);
             require(signer > lastSigner, "Bridge: duplicate or unordered sig");
             lastSigner = signer;
             if (isValidator[signer]) {
@@ -101,6 +142,7 @@ contract TokenBridge is ReentrancyGuard {
 
         require(validSigs >= requiredSignatures, "Bridge: not enough valid sigs");
         processedHashes[messageHash] = true;
+        claimNonces[recipient]++;
 
         IERC20(token).safeTransfer(recipient, amount);
         emit TokensClaimed(messageHash, token, recipient, amount);
@@ -116,6 +158,33 @@ contract TokenBridge is ReentrancyGuard {
         emit ValidatorRemoved(validator);
     }
 
+    function claimHash(
+        address token,
+        address recipient,
+        uint256 amount,
+        uint256 nonce
+    ) external view returns (bytes32) {
+        return _claimHash(token, recipient, amount, nonce);
+    }
+
+    function _claimHash(
+        address token,
+        address recipient,
+        uint256 amount,
+        uint256 nonce
+    ) internal view returns (bytes32) {
+        bytes32 structHash = keccak256(abi.encode(
+            CLAIM_TYPEHASH,
+            block.chainid,
+            address(this),
+            token,
+            recipient,
+            amount,
+            nonce
+        ));
+        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR(), structHash));
+    }
+
     /// @dev Recover signer from an ECDSA signature.
     function _recover(bytes32 hash, bytes memory sig) internal pure returns (address) {
         require(sig.length == 65, "Bridge: invalid sig length");
@@ -127,6 +196,8 @@ contract TokenBridge is ReentrancyGuard {
             s := mload(add(sig, 64))
             v := byte(0, mload(add(sig, 96)))
         }
-        return ecrecover(hash, v, r, s);
+        address signer = ecrecover(hash, v, r, s);
+        require(signer != address(0), "Bridge: invalid signer");
+        return signer;
     }
 }
