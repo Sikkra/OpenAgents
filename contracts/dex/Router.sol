@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "@openzeppelin/contracts/utils/math/Math.sol";
+
 interface IAMMPool {
     function swap(address tokenIn, uint256 amountIn, uint256 minAmountOut) external returns (uint256);
     function getReserves() external view returns (uint256, uint256);
@@ -16,8 +18,8 @@ interface IERC20 {
 }
 
 /// @title Router
-/// @notice Multi-hop swap router that routes trades through multiple AMM pools
-/// @dev Each hop uses a registered pool; tokens flow through the router
+/// @notice Multi-hop swap router that routes trades through multiple AMM pools.
+/// @dev Each hop uses a registered pool; tokens flow through the router.
 contract Router {
     address public admin;
 
@@ -38,40 +40,66 @@ contract Router {
         emit PoolRegistered(_tokenA, _tokenB, _pool);
     }
 
-    // BUG: No slippage protection — minAmountOut is passed as 0 to every intermediate hop,
-    // so a sandwich attacker can extract maximum value from multi-hop trades
-    // BUG: Path validation missing — no check that path[0] != path[path.length-1],
-    // allowing circular swaps (A->B->A) that waste gas and may be used in attacks
-    // BUG: Intermediate amounts not validated — if a pool returns 0 from swap,
-    // subsequent hops proceed with 0 input, silently producing a 0-output trade
+    function swapExactTokensForTokens(
+        address[] calldata path,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint256 deadline
+    ) external returns (uint256 amountOut) {
+        return _swapMultiHop(path, amountIn, minAmountOut, deadline);
+    }
+
     function swapMultiHop(
         address[] calldata path,
         uint256 amountIn,
-        uint256 /* minAmountOut */
+        uint256 minAmountOut,
+        uint256 deadline
     ) external returns (uint256 amountOut) {
-        require(path.length >= 2, "Path too short");
+        return _swapMultiHop(path, amountIn, minAmountOut, deadline);
+    }
 
-        IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn);
+    function _swapMultiHop(
+        address[] calldata path,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        uint256 deadline
+    ) internal returns (uint256 amountOut) {
+        require(block.timestamp <= deadline, "Deadline expired");
+        require(path.length >= 2, "Path too short");
+        require(amountIn > 0, "Zero input");
+        require(minAmountOut > 0, "Zero min output");
+        _validatePath(path);
+
+        uint256 quotedFinalOut = _quotePath(path, amountIn);
+        require(quotedFinalOut >= minAmountOut, "Slippage exceeded");
+        require(IERC20(path[0]).transferFrom(msg.sender, address(this), amountIn), "Transfer in failed");
 
         uint256 currentAmount = amountIn;
 
         for (uint256 i = 0; i < path.length - 1; i++) {
             address tokenIn = path[i];
             address tokenOut = path[i + 1];
-
             address pool = pools[tokenIn][tokenOut];
             require(pool != address(0), "No pool for pair");
 
-            IERC20(tokenIn).approve(pool, currentAmount);
+            uint256 expectedHopOut = _quoteHop(tokenIn, tokenOut, currentAmount);
+            uint256 hopMinAmountOut = Math.mulDiv(
+                expectedHopOut,
+                minAmountOut,
+                quotedFinalOut,
+                Math.Rounding.Ceil
+            );
+            require(hopMinAmountOut > 0, "Zero output");
 
-            // Passes 0 as minAmountOut — no slippage protection on intermediate hops
-            currentAmount = IAMMPool(pool).swap(tokenIn, currentAmount, 0);
+            require(IERC20(tokenIn).approve(pool, currentAmount), "Approve failed");
+            currentAmount = IAMMPool(pool).swap(tokenIn, currentAmount, hopMinAmountOut);
+            require(currentAmount >= hopMinAmountOut, "Slippage exceeded");
+            require(currentAmount > 0, "Zero output");
         }
 
         amountOut = currentAmount;
-
-        // Transfer final tokens to user
-        IERC20(path[path.length - 1]).transfer(msg.sender, amountOut);
+        require(amountOut >= minAmountOut, "Slippage exceeded");
+        require(IERC20(path[path.length - 1]).transfer(msg.sender, amountOut), "Transfer out failed");
 
         emit MultiHopSwap(msg.sender, path, amountIn, amountOut);
     }
@@ -80,21 +108,55 @@ contract Router {
         address[] calldata path,
         uint256 amountIn
     ) external view returns (uint256 estimatedOut) {
+        return _quotePath(path, amountIn);
+    }
+
+    function _quotePath(
+        address[] calldata path,
+        uint256 amountIn
+    ) internal view returns (uint256 estimatedOut) {
+        require(path.length >= 2, "Path too short");
+        require(amountIn > 0, "Zero input");
+        _validatePath(path);
+
         uint256 currentAmount = amountIn;
-
         for (uint256 i = 0; i < path.length - 1; i++) {
-            address pool = pools[path[i]][path[i + 1]];
-            require(pool != address(0), "No pool");
-
-            (uint256 resA, uint256 resB) = IAMMPool(pool).getReserves();
-            address tA = IAMMPool(pool).tokenA();
-
-            (uint256 resIn, uint256 resOut) = (path[i] == tA) ? (resA, resB) : (resB, resA);
-            uint256 amountInWithFee = currentAmount * 9970;
-            currentAmount = (amountInWithFee * resOut) / (resIn * 10000 + amountInWithFee);
+            currentAmount = _quoteHop(path[i], path[i + 1], currentAmount);
         }
-
         return currentAmount;
+    }
+
+    function _quoteHop(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) internal view returns (uint256 amountOut) {
+        address pool = pools[tokenIn][tokenOut];
+        require(pool != address(0), "No pool");
+
+        (uint256 resA, uint256 resB) = IAMMPool(pool).getReserves();
+        address tA = IAMMPool(pool).tokenA();
+        address tB = IAMMPool(pool).tokenB();
+        require(
+            (tokenIn == tA && tokenOut == tB) || (tokenIn == tB && tokenOut == tA),
+            "Pool mismatch"
+        );
+
+        (uint256 resIn, uint256 resOut) = (tokenIn == tA) ? (resA, resB) : (resB, resA);
+        require(resIn > 0 && resOut > 0, "Empty pool");
+
+        uint256 amountInWithFee = amountIn * 9970;
+        amountOut = (amountInWithFee * resOut) / (resIn * 10000 + amountInWithFee);
+        require(amountOut > 0, "Zero output");
+    }
+
+    function _validatePath(address[] calldata path) internal pure {
+        for (uint256 i = 0; i < path.length; i++) {
+            require(path[i] != address(0), "Invalid path");
+            for (uint256 j = i + 1; j < path.length; j++) {
+                require(path[i] != path[j], "Circular path");
+            }
+        }
     }
 
     function getPool(address tokenA, address tokenB) external view returns (address) {
