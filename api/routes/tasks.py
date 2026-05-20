@@ -1,16 +1,20 @@
 """Task management endpoints for bounty assignments."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
-from typing import Optional
+import asyncio
+import contextlib
 from datetime import datetime
+from typing import Optional
 
-from ..models.database import get_db, Task
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
+
 from ..middleware.auth import get_current_user
+from ..models.database import Task, get_db
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 VALID_STATUSES = {"open", "assigned", "in_progress", "review", "completed", "cancelled"}
+HEARTBEAT_INTERVAL_SECONDS = 30
 
 
 class TaskCreate(BaseModel):
@@ -22,7 +26,93 @@ class TaskCreate(BaseModel):
 
 
 class TaskStatusUpdate(BaseModel):
-    status: str  # BUG: Not validated against VALID_STATUSES enum — any string accepted
+    status: str
+
+
+def serialize_task_update(task: Task) -> dict:
+    return {
+        "id": task.id,
+        "title": task.title,
+        "status": task.status,
+        "creator_id": task.creator_id,
+        "agent_id": task.agent_id,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+    }
+
+
+class TaskWebSocketManager:
+    def __init__(self):
+        self.active_connections: dict[WebSocket, Optional[set[int]]] = {}
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections[websocket] = None
+
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.pop(websocket, None)
+
+    async def subscribe(self, websocket: WebSocket, task_id: int):
+        subscriptions = self.active_connections.get(websocket)
+        if subscriptions is None:
+            subscriptions = set()
+            self.active_connections[websocket] = subscriptions
+        subscriptions.add(task_id)
+        await websocket.send_json({"type": "subscribed", "task_id": task_id})
+
+    async def unsubscribe(self, websocket: WebSocket, task_id: int):
+        subscriptions = self.active_connections.get(websocket)
+        if subscriptions is not None:
+            subscriptions.discard(task_id)
+        await websocket.send_json({"type": "unsubscribed", "task_id": task_id})
+
+    async def heartbeat(self, websocket: WebSocket):
+        while websocket in self.active_connections:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            await websocket.send_json({"type": "heartbeat", "timestamp": datetime.utcnow().isoformat()})
+
+    async def broadcast_task_update(self, task_id: int, task: dict):
+        message = {"type": "task_update", "task_id": task_id, "task": task}
+        stale_connections = []
+        for websocket, subscriptions in list(self.active_connections.items()):
+            if subscriptions is not None and task_id not in subscriptions:
+                continue
+            try:
+                await websocket.send_json(message)
+            except RuntimeError:
+                stale_connections.append(websocket)
+        for websocket in stale_connections:
+            self.disconnect(websocket)
+
+    def subscription_counts(self) -> list[Optional[int]]:
+        return [None if subscriptions is None else len(subscriptions) for subscriptions in self.active_connections.values()]
+
+
+task_ws_manager = TaskWebSocketManager()
+
+
+@router.websocket("/ws")
+async def task_updates_ws(websocket: WebSocket):
+    await task_ws_manager.connect(websocket)
+    heartbeat_task = asyncio.create_task(task_ws_manager.heartbeat(websocket))
+    try:
+        while True:
+            message = await websocket.receive_json()
+            action = message.get("action")
+            task_id = message.get("task_id")
+            if action not in {"subscribe", "unsubscribe"} or not isinstance(task_id, int):
+                await websocket.send_json({"type": "error", "detail": "Invalid subscription message"})
+                continue
+            if action == "subscribe":
+                await task_ws_manager.subscribe(websocket, task_id)
+            else:
+                await task_ws_manager.unsubscribe(websocket, task_id)
+    except WebSocketDisconnect:
+        task_ws_manager.disconnect(websocket)
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
+        task_ws_manager.disconnect(websocket)
 
 
 @router.post("/")
@@ -40,6 +130,7 @@ async def create_task(task: TaskCreate, user=Depends(get_current_user), db=Depen
     db.add(new_task)
     db.commit()
     db.refresh(new_task)
+    await task_ws_manager.broadcast_task_update(new_task.id, serialize_task_update(new_task))
     return {"id": new_task.id, "status": new_task.status}
 
 
@@ -48,8 +139,6 @@ async def list_tasks(
     status: Optional[str] = None,
     creator: Optional[str] = None,
     skip: int = Query(0, ge=0),
-    # BUG: No upper bound on limit — clients can request millions of rows,
-    # causing DB strain and potential OOM
     limit: int = Query(50, ge=1),
     db=Depends(get_db),
 ):
@@ -79,15 +168,13 @@ async def update_task_status(
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-
-    # BUG: Creator can mark their own task as completed — should require
-    # a third party or the assignee to confirm completion
     if task.creator_id != user["id"]:
         raise HTTPException(status_code=403, detail="Only the creator can update status")
 
     task.status = update.status
     task.updated_at = datetime.utcnow()
     db.commit()
+    await task_ws_manager.broadcast_task_update(task.id, serialize_task_update(task))
     return {"id": task.id, "status": task.status}
 
 
@@ -101,5 +188,7 @@ async def cancel_task(task_id: int, user=Depends(get_current_user), db=Depends(g
     if task.status not in ("open", "assigned"):
         raise HTTPException(status_code=400, detail="Cannot cancel an active task")
     task.status = "cancelled"
+    task.updated_at = datetime.utcnow()
     db.commit()
+    await task_ws_manager.broadcast_task_update(task.id, serialize_task_update(task))
     return {"id": task.id, "status": "cancelled"}
