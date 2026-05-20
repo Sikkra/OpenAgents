@@ -30,7 +30,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     address = Column(String(42), unique=True, nullable=False)
     username = Column(String(64), unique=True, nullable=True)
-    # BUG: No index on address — wallet lookups on every auth request do full table scans
+    # BUG: No index on address - wallet lookups on every auth request do full table scans
     created_at = Column(DateTime, default=datetime.utcnow)  # BUG: naive datetime, no timezone
 
     agents = relationship("Agent", back_populates="owner")
@@ -47,7 +47,7 @@ class Agent(Base):
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
-    # BUG: No cascade delete — deleting a user leaves orphaned agents
+    # BUG: No cascade delete - deleting a user leaves orphaned agents
     owner = relationship("User", back_populates="agents")
     tasks = relationship("Task", back_populates="agent")
 
@@ -79,11 +79,26 @@ class Payment(Base):
     to_address = Column(String(42), nullable=True)
     amount = Column(Float, nullable=False)
     token_address = Column(String(42), default="0x0000000000000000000000000000000000000000")
+    idempotency_key = Column(String(128), nullable=True, index=True)
+    claim_idempotency_key = Column(String(128), nullable=True, index=True)
     status = Column(String(32), default="pending")
     created_at = Column(DateTime, default=datetime.utcnow)
     claimed_at = Column(DateTime, nullable=True)
 
     task = relationship("Task", back_populates="payments")
+
+
+class PaymentAuditLog(Base):
+    __tablename__ = "payment_audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    payment_id = Column(Integer, ForeignKey("payments.id"), nullable=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=False, index=True)
+    action = Column(String(64), nullable=False)
+    actor_address = Column(String(42), nullable=True)
+    amount = Column(Float, nullable=True)
+    details = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 def init_db():
