@@ -1,13 +1,18 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
+from sqlalchemy.orm import Session
+
+from api.middleware.auth import create_api_key, get_current_user, revoke_api_key
+from api.models.database import get_db, init_db
 
 app = FastAPI(
     title="OpenAgents API",
     description="Off-chain indexer and agent discovery API for the OpenAgents protocol",
     version="0.1.0",
 )
+init_db()
 
 
 class AgentResponse(BaseModel):
@@ -37,6 +42,17 @@ class LeaderboardEntry(BaseModel):
     reputation: int
     tasks_completed: int
     success_rate: float
+
+
+class APIKeyCreateRequest(BaseModel):
+    name: Optional[str] = None
+
+
+class APIKeyCreateResponse(BaseModel):
+    id: str
+    key: str
+    name: Optional[str] = None
+    created_at: datetime
 
 
 # In-memory store (placeholder for DB)
@@ -100,6 +116,30 @@ async def leaderboard(limit: int = Query(20, le=50)):
         )
     entries.sort(key=lambda x: x["reputation"], reverse=True)
     return entries[:limit]
+
+
+@app.get("/auth/me")
+async def auth_me(user: dict = Depends(get_current_user)):
+    return user
+
+
+@app.post("/auth/api-keys", response_model=APIKeyCreateResponse)
+async def create_auth_api_key(
+    request: APIKeyCreateRequest,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return create_api_key(db, user, request.name)
+
+
+@app.delete("/auth/api-keys/{key_id}")
+async def revoke_auth_api_key(
+    key_id: str,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    revoke_api_key(db, key_id, user)
+    return {"revoked": True}
 
 
 @app.get("/health")
