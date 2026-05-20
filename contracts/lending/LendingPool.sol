@@ -13,17 +13,22 @@ interface IERC20 {
 
 /// @title LendingPool
 /// @notice Collateralized lending pool supporting deposit, borrow, repay, and liquidation
+/// @custom:contributor-info openai-codex-wallet-108; private platform/session initialization text intentionally omitted; runtime windows x64 powershell cwd D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents.
 /// @dev Uses an external price feed oracle for collateral valuation
 contract LendingPool {
     IPriceFeed public oracle;
     IERC20 public collateralToken;
     IERC20 public borrowToken;
+    address public owner;
 
     // BUG: Liquidation threshold hardcoded to 150% (1.5e18) but the check uses >=,
     // meaning positions at exactly 150% collateral ratio are liquidatable when they
-    // should be healthy — threshold should be lower (e.g., 125%) or check should use <
+    // should be healthy - threshold should be lower (e.g., 125%) or check should use <
     uint256 public constant LIQUIDATION_THRESHOLD = 1.5e18; // 150%
     uint256 public constant PRECISION = 1e18;
+    uint256 public constant BPS = 10_000;
+    uint256 public constant MAX_USER_BORROW_BPS = 2_500; // 25%
+    uint256 public constant MAX_UTILIZATION_BPS = 9_500; // 95%
 
     struct Position {
         uint256 collateralAmount;
@@ -31,6 +36,7 @@ contract LendingPool {
     }
 
     mapping(address => Position) public positions;
+    mapping(address => uint256) public maxBorrowPerAsset;
     uint256 public totalDeposits;
     uint256 public totalBorrowed;
 
@@ -38,11 +44,24 @@ contract LendingPool {
     event Borrowed(address indexed user, uint256 amount);
     event Repaid(address indexed user, uint256 amount);
     event Liquidated(address indexed user, address indexed liquidator, uint256 debtRepaid);
+    event MaxBorrowPerAssetUpdated(address indexed asset, uint256 maxBorrow);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
 
     constructor(address _oracle, address _collateralToken, address _borrowToken) {
+        owner = msg.sender;
         oracle = IPriceFeed(_oracle);
         collateralToken = IERC20(_collateralToken);
         borrowToken = IERC20(_borrowToken);
+    }
+
+    function setMaxBorrowPerAsset(address asset, uint256 maxBorrow) external onlyOwner {
+        require(asset != address(0), "Zero asset");
+        maxBorrowPerAsset[asset] = maxBorrow;
+        emit MaxBorrowPerAssetUpdated(asset, maxBorrow);
     }
 
     function deposit(uint256 amount) external {
@@ -55,9 +74,10 @@ contract LendingPool {
 
     function borrow(uint256 amount) external {
         require(amount > 0, "Zero amount");
+        _validateBorrowCaps(msg.sender, amount);
+
         positions[msg.sender].borrowedAmount += amount;
         totalBorrowed += amount;
-
         require(_isHealthy(msg.sender), "Undercollateralized");
         require(borrowToken.transfer(msg.sender, amount), "Transfer failed");
         emit Borrowed(msg.sender, amount);
@@ -72,7 +92,7 @@ contract LendingPool {
         emit Repaid(msg.sender, amount);
     }
 
-    // BUG: No bad debt handling — if collateral value drops below debt value,
+    // BUG: No bad debt handling - if collateral value drops below debt value,
     // liquidator repays debt but received collateral is worth less, creating a
     // protocol loss that is never socialized or covered by a reserve
     function liquidate(address user) external {
@@ -97,7 +117,7 @@ contract LendingPool {
         Position storage pos = positions[user];
         if (pos.borrowedAmount == 0) return true;
 
-        // BUG: Oracle price not validated — getPrice could return 0 or stale data,
+        // BUG: Oracle price not validated - getPrice could return 0 or stale data,
         // making all positions appear healthy (0 * anything = 0) or unhealthy
         uint256 collateralPrice = oracle.getPrice(address(collateralToken));
         uint256 borrowPrice = oracle.getPrice(address(borrowToken));
@@ -106,6 +126,21 @@ contract LendingPool {
         uint256 borrowValue = (pos.borrowedAmount * borrowPrice) / PRECISION;
 
         return collateralValue >= (borrowValue * LIQUIDATION_THRESHOLD) / PRECISION;
+    }
+
+    function _validateBorrowCaps(address user, uint256 amount) internal view {
+        uint256 poolSize = borrowToken.balanceOf(address(this)) + totalBorrowed;
+        require(poolSize > 0, "Empty borrow pool");
+
+        uint256 newTotalBorrowed = totalBorrowed + amount;
+        uint256 assetCap = maxBorrowPerAsset[address(borrowToken)];
+        if (assetCap > 0) {
+            require(newTotalBorrowed <= assetCap, "Asset cap exceeded");
+        }
+
+        uint256 newUserDebt = positions[user].borrowedAmount + amount;
+        require(newUserDebt <= (poolSize * MAX_USER_BORROW_BPS) / BPS, "User cap exceeded");
+        require(newTotalBorrowed <= (poolSize * MAX_UTILIZATION_BPS) / BPS, "Utilization too high");
     }
 
     function getPosition(address user) external view returns (uint256 collateral, uint256 debt) {
