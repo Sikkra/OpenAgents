@@ -1,46 +1,56 @@
 """JWT authentication middleware for the OpenAgents API."""
 
-import jwt
 import os
-from fastapi import Request, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from uuid import uuid4
 
-# BUG: No fallback — if JWT_SECRET is not set, os.environ[] raises KeyError
-# crashing the entire application on startup
-JWT_SECRET = os.environ["JWT_SECRET"]
+import jwt
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+JWT_SECRET = os.environ.get("JWT_SECRET", "openagents-development-secret-please-change")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 30
+REVOKED_JTIS: set[str] = set()
+REVOKED_TOKENS: set[str] = set()
 
 security = HTTPBearer()
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire, "iat": datetime.utcnow(), "type": "access"})
+    now = datetime.now(timezone.utc)
+    expire = now + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire, "iat": now, "type": "access", "jti": str(uuid4())})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 def create_refresh_token(data: dict) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "iat": datetime.utcnow(), "type": "refresh"})
+    now = datetime.now(timezone.utc)
+    expire = now + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "iat": now, "type": "refresh", "jti": str(uuid4())})
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def is_token_revoked(token: str, payload: dict) -> bool:
+    jti = payload.get("jti")
+    return token in REVOKED_TOKENS or (jti is not None and jti in REVOKED_JTIS)
 
 
 def decode_token(token: str) -> dict:
     try:
-        # BUG: Algorithm not pinned in decode — attacker can forge a token with
-        # alg: "none" and bypass signature verification entirely
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256", "none"])
-        return payload
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+    if is_token_revoked(token, payload):
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+    return payload
 
 
 async def get_current_user(
@@ -52,8 +62,6 @@ async def get_current_user(
     if payload.get("type") != "access":
         raise HTTPException(status_code=401, detail="Invalid token type")
 
-    # BUG: No token revocation check — logged-out or compromised tokens
-    # remain valid until they naturally expire
     user_data = {
         "id": payload.get("sub"),
         "address": payload.get("address"),
@@ -71,7 +79,36 @@ def require_role(role: str):
         if role not in user.get("roles", []):
             raise HTTPException(status_code=403, detail=f"Role '{role}' required")
         return user
+
     return role_checker
+
+
+def refresh_access_token(refresh_token: str) -> dict:
+    payload = decode_token(refresh_token)
+    if payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Invalid token type")
+
+    data = {
+        "sub": payload.get("sub"),
+        "address": payload.get("address"),
+        "roles": payload.get("roles", []),
+    }
+    if not data["sub"]:
+        raise HTTPException(status_code=401, detail="Invalid token payload")
+
+    return {
+        "token": create_access_token(data),
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    }
+
+
+def revoke_token(token: str) -> None:
+    payload = decode_token(token)
+    jti = payload.get("jti")
+    if jti:
+        REVOKED_JTIS.add(jti)
+    else:
+        REVOKED_TOKENS.add(token)
 
 
 def generate_login_tokens(user_id: str, address: str, roles: list = None) -> dict:

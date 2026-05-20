@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 
+from api.middleware.auth import refresh_access_token, revoke_token
+
 app = FastAPI(
     title="OpenAgents API",
     description="Off-chain indexer and agent discovery API for the OpenAgents protocol",
@@ -37,6 +39,19 @@ class LeaderboardEntry(BaseModel):
     reputation: int
     tasks_completed: int
     success_rate: float
+
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+
+class TokenResponse(BaseModel):
+    token: str
+    expires_in: int
+
+
+class RevokeTokenRequest(BaseModel):
+    token: str
 
 
 # In-memory store (placeholder for DB)
@@ -100,6 +115,17 @@ async def leaderboard(limit: int = Query(20, le=50)):
         )
     entries.sort(key=lambda x: x["reputation"], reverse=True)
     return entries[:limit]
+
+
+@app.post("/auth/refresh", response_model=TokenResponse)
+async def refresh_token(request: RefreshTokenRequest):
+    return refresh_access_token(request.refresh_token)
+
+
+@app.post("/auth/revoke")
+async def revoke_auth_token(request: RevokeTokenRequest):
+    revoke_token(request.token)
+    return {"revoked": True}
 
 
 @app.get("/health")
