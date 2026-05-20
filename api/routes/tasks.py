@@ -1,16 +1,25 @@
 """Task management endpoints for bounty assignments."""
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
-from typing import Optional
 from datetime import datetime
+from typing import Optional
 
-from ..models.database import get_db, Task
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, field_validator
+
 from ..middleware.auth import get_current_user
+from ..models.database import Agent, Task, get_db
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 VALID_STATUSES = {"open", "assigned", "in_progress", "review", "completed", "cancelled"}
+STATUS_TRANSITIONS = {
+    "open": {"assigned", "cancelled"},
+    "assigned": {"in_progress", "cancelled"},
+    "in_progress": {"review", "cancelled"},
+    "review": {"completed", "in_progress", "cancelled"},
+    "completed": set(),
+    "cancelled": set(),
+}
 
 
 class TaskCreate(BaseModel):
@@ -22,7 +31,14 @@ class TaskCreate(BaseModel):
 
 
 class TaskStatusUpdate(BaseModel):
-    status: str  # BUG: Not validated against VALID_STATUSES enum — any string accepted
+    status: str
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        if value not in VALID_STATUSES:
+            raise ValueError(f"status must be one of: {', '.join(sorted(VALID_STATUSES))}")
+        return value
 
 
 @router.post("/")
@@ -48,9 +64,7 @@ async def list_tasks(
     status: Optional[str] = None,
     creator: Optional[str] = None,
     skip: int = Query(0, ge=0),
-    # BUG: No upper bound on limit — clients can request millions of rows,
-    # causing DB strain and potential OOM
-    limit: int = Query(50, ge=1),
+    limit: int = Query(50, ge=1, le=100),
     db=Depends(get_db),
 ):
     query = db.query(Task)
@@ -80,9 +94,24 @@ async def update_task_status(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    # BUG: Creator can mark their own task as completed — should require
-    # a third party or the assignee to confirm completion
-    if task.creator_id != user["id"]:
+    if update.status == task.status:
+        return {"id": task.id, "status": task.status}
+
+    allowed_statuses = STATUS_TRANSITIONS.get(task.status, set())
+    if update.status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot transition task from {task.status} to {update.status}",
+        )
+
+    if update.status == "completed":
+        if _same_id(task.creator_id, user["id"]):
+            raise HTTPException(status_code=403, detail="Task creator cannot complete their own task")
+
+        agent = db.query(Agent).filter(Agent.id == task.agent_id).first()
+        if not agent or not _same_id(agent.owner_id, user["id"]):
+            raise HTTPException(status_code=403, detail="Only the assigned agent can complete task")
+    elif not _same_id(task.creator_id, user["id"]):
         raise HTTPException(status_code=403, detail="Only the creator can update status")
 
     task.status = update.status
@@ -96,10 +125,14 @@ async def cancel_task(task_id: int, user=Depends(get_current_user), db=Depends(g
     task = db.query(Task).filter(Task.id == task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    if task.creator_id != user["id"]:
+    if not _same_id(task.creator_id, user["id"]):
         raise HTTPException(status_code=403, detail="Only the creator can cancel")
     if task.status not in ("open", "assigned"):
         raise HTTPException(status_code=400, detail="Cannot cancel an active task")
     task.status = "cancelled"
     db.commit()
     return {"id": task.id, "status": "cancelled"}
+
+
+def _same_id(left, right) -> bool:
+    return str(left) == str(right)
