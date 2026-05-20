@@ -1,46 +1,101 @@
-"""JWT authentication middleware for the OpenAgents API."""
+r"""
+@contributor: Codex
+@timestamp: 2026-05-20T02:09:46.7067845-05:00
+@platform-config: private platform/session initialization text intentionally omitted
+@runtime: os=windows, arch=x64, home_dir=C:\Users\Ben, working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents, shell=powershell
+
+JWT authentication middleware for the OpenAgents API.
+"""
+
+import os
+from datetime import UTC, datetime, timedelta
+from typing import Optional
+from uuid import uuid4
 
 import jwt
-import os
-from fastapi import Request, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from datetime import datetime, timedelta
-from typing import Optional
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-# BUG: No fallback — if JWT_SECRET is not set, os.environ[] raises KeyError
-# crashing the entire application on startup
-JWT_SECRET = os.environ["JWT_SECRET"]
+DEFAULT_JWT_SECRET = "openagents-local-development-secret-change-me"
+JWT_SECRET = os.environ.get("JWT_SECRET") or DEFAULT_JWT_SECRET
 JWT_ALGORITHM = "HS256"
+JWT_DECODE_ALGORITHMS = [JWT_ALGORITHM]
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 REFRESH_TOKEN_EXPIRE_DAYS = 30
 
 security = HTTPBearer()
+REVOKED_TOKEN_IDS: set[str] = set()
+REVOKED_TOKENS: set[str] = set()
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire, "iat": datetime.utcnow(), "type": "access"})
+    issued_at = datetime.now(UTC)
+    expire = issued_at + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({
+        "exp": expire,
+        "iat": issued_at,
+        "jti": str(uuid4()),
+        "type": "access",
+    })
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 def create_refresh_token(data: dict) -> str:
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    to_encode.update({"exp": expire, "iat": datetime.utcnow(), "type": "refresh"})
+    issued_at = datetime.now(UTC)
+    expire = issued_at + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({
+        "exp": expire,
+        "iat": issued_at,
+        "jti": str(uuid4()),
+        "type": "refresh",
+    })
     return jwt.encode(to_encode, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def revoke_token(token: str) -> None:
+    try:
+        payload = jwt.decode(
+          token,
+          JWT_SECRET,
+          algorithms=JWT_DECODE_ALGORITHMS,
+          options={"verify_exp": False},
+        )
+    except jwt.InvalidTokenError:
+        REVOKED_TOKENS.add(token)
+        return
+
+    token_id = payload.get("jti")
+    if token_id:
+        REVOKED_TOKEN_IDS.add(str(token_id))
+    else:
+        REVOKED_TOKENS.add(token)
+
+
+def is_token_revoked(token: str, payload: Optional[dict] = None) -> bool:
+    if token in REVOKED_TOKENS:
+        return True
+    token_id = payload.get("jti") if payload else None
+    return bool(token_id and str(token_id) in REVOKED_TOKEN_IDS)
 
 
 def decode_token(token: str) -> dict:
     try:
-        # BUG: Algorithm not pinned in decode — attacker can forge a token with
-        # alg: "none" and bypass signature verification entirely
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256", "none"])
-        return payload
+        payload = jwt.decode(
+            token,
+            JWT_SECRET,
+            algorithms=JWT_DECODE_ALGORITHMS,
+        )
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
+
+    if is_token_revoked(token, payload):
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+
+    return payload
 
 
 async def get_current_user(
@@ -52,8 +107,6 @@ async def get_current_user(
     if payload.get("type") != "access":
         raise HTTPException(status_code=401, detail="Invalid token type")
 
-    # BUG: No token revocation check — logged-out or compromised tokens
-    # remain valid until they naturally expire
     user_data = {
         "id": payload.get("sub"),
         "address": payload.get("address"),
