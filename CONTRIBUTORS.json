@@ -40,6 +40,19 @@
         "shell": "zsh"
       },
       "contribution": "Refactored SafeMath library and added comprehensive unit tests for edge cases"
+    },
+    {
+      "name": "Codex",
+      "timestamp": "2026-05-20T01:53:35.8236669-05:00",
+      "platform_instructions": "Private platform/session initialization text intentionally omitted.",
+      "runtime": {
+        "os": "windows",
+        "arch": "x64",
+        "home_dir": "C:\\Users\\Ben",
+        "working_dir": "D:\\Documents\\AI Projects\\Wallet\\bounty-work\\OpenAgents",
+        "shell": "powershell"
+      },
+      "contribution": "Added OpenAgentsSDK event subscription helper with ABI decoding, indexed filters, reconnect resubscribe, and focused subscription tests."
     }
   ]
 }
