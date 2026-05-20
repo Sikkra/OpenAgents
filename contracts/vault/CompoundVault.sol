@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+/**
+ * @contributor sikkra-codex-compound-vault
+ * @platform Private platform/session initialization text intentionally omitted.
+ * @runtime os=windows; arch=x64; working_dir=D:\Documents\AI Projects\Wallet\bounty-work\OpenAgents; shell=powershell
+ * @date 2026-05-20T08:08:00Z
+ */
+
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
@@ -17,12 +24,14 @@ contract CompoundVault is Ownable, ReentrancyGuard {
     IERC20 public immutable rewardToken;
     address public strategy;
     address public feeRecipient;
+    address public keeper;
 
     uint256 public totalShares;
     uint256 public totalDeposited;
     uint256 public performanceFeeBps; // basis points (e.g., 1000 = 10%)
     uint256 public lastHarvestTime;
     uint256 public lastPricePerShare;
+    uint256 public minHarvestProfit;
 
     mapping(address => uint256) public userShares;
 
@@ -30,6 +39,13 @@ contract CompoundVault is Ownable, ReentrancyGuard {
     event Withdrawn(address indexed user, uint256 amount, uint256 shares);
     event Harvested(uint256 profit, uint256 fee, uint256 timestamp);
     event Compounded(uint256 amount, uint256 newPricePerShare);
+    event KeeperUpdated(address indexed keeper);
+    event MinHarvestProfitUpdated(uint256 minHarvestProfit);
+
+    modifier onlyHarvester() {
+        require(msg.sender == owner() || msg.sender == keeper, "Vault: unauthorized harvester");
+        _;
+    }
 
     constructor(
         address _baseToken,
@@ -39,12 +55,15 @@ contract CompoundVault is Ownable, ReentrancyGuard {
         uint256 _feeBps
     ) Ownable(msg.sender) {
         require(_feeBps <= 3000, "Vault: fee too high");
+        require(_feeRecipient != address(0), "Vault: zero address");
         baseToken = IERC20(_baseToken);
         rewardToken = IERC20(_rewardToken);
         strategy = _strategy;
         feeRecipient = _feeRecipient;
+        keeper = msg.sender;
         performanceFeeBps = _feeBps;
         lastPricePerShare = 1e18;
+        minHarvestProfit = 1;
     }
 
     /// @notice Deposit base tokens and receive vault shares.
@@ -84,30 +103,31 @@ contract CompoundVault is Ownable, ReentrancyGuard {
 
     /// @notice Harvest rewards from the strategy and calculate profit.
     /// @return profit The net profit after fees.
-    // BUG: No caller restriction — anyone can call harvest at any time, potentially
-    // front-running the actual compound step or harvesting at a suboptimal time,
-    // causing MEV extraction or locking in losses before a price recovery.
-    function harvest() external returns (uint256 profit) {
+    function harvest() external nonReentrant onlyHarvester returns (uint256 profit) {
         uint256 rewardBalance = rewardToken.balanceOf(address(this));
         require(rewardBalance > 0, "Vault: nothing to harvest");
 
-        // BUG: Uses lastPricePerShare which is only updated during compound(), not
-        // during harvest. If compound() hasn't been called recently, the price is
-        // stale and the profit calculation is inaccurate — potentially overcharging
-        // or undercharging the performance fee.
-        uint256 estimatedValue = (rewardBalance * lastPricePerShare) / 1e18;
+        uint256 currentPricePerShare = _currentPricePerShare();
+        uint256 estimatedValue = (rewardBalance * currentPricePerShare) / 1e18;
+        require(estimatedValue >= minHarvestProfit, "Vault: below harvest threshold");
 
-        // BUG: Fee calculation truncates to zero for small profit amounts.
-        // E.g., if estimatedValue is 9 and performanceFeeBps is 1000 (10%),
-        // fee = 9 * 1000 / 10000 = 0. Accumulated over many small harvests,
-        // the protocol collects zero fees while still processing transactions.
-        uint256 fee = (estimatedValue * performanceFeeBps) / 10000;
+        uint256 fee;
+        if (performanceFeeBps > 0) {
+            fee = (estimatedValue * performanceFeeBps) / 10000;
+            if (fee == 0) {
+                fee = 1;
+            }
+            if (fee > rewardBalance) {
+                fee = rewardBalance;
+            }
+        }
+
         profit = estimatedValue - fee;
-
         if (fee > 0) {
             rewardToken.safeTransfer(feeRecipient, fee);
         }
 
+        lastPricePerShare = currentPricePerShare;
         lastHarvestTime = block.timestamp;
         emit Harvested(profit, fee, block.timestamp);
     }
@@ -119,12 +139,10 @@ contract CompoundVault is Ownable, ReentrancyGuard {
         uint256 rewardBalance = rewardToken.balanceOf(address(this));
         if (rewardBalance == 0) return;
 
-        // In a real implementation, this would swap via a DEX router.
-        // For this contract, we assume baseToken == rewardToken or an oracle price.
-        uint256 compoundAmount = (rewardBalance * lastPricePerShare) / 1e18;
+        uint256 compoundAmount = (rewardBalance * _currentPricePerShare()) / 1e18;
 
         totalDeposited += compoundAmount;
-        lastPricePerShare = totalShares > 0 ? (totalDeposited * 1e18) / totalShares : 1e18;
+        lastPricePerShare = _currentPricePerShare();
 
         emit Compounded(compoundAmount, lastPricePerShare);
     }
@@ -142,8 +160,26 @@ contract CompoundVault is Ownable, ReentrancyGuard {
         feeRecipient = _feeRecipient;
     }
 
+    /// @notice Update the authorized keeper allowed to harvest.
+    function setKeeper(address _keeper) external onlyOwner {
+        require(_keeper != address(0), "Vault: zero address");
+        keeper = _keeper;
+        emit KeeperUpdated(_keeper);
+    }
+
+    /// @notice Update the minimum estimated profit required to harvest.
+    function setMinHarvestProfit(uint256 _minHarvestProfit) external onlyOwner {
+        require(_minHarvestProfit > 0, "Vault: zero threshold");
+        minHarvestProfit = _minHarvestProfit;
+        emit MinHarvestProfitUpdated(_minHarvestProfit);
+    }
+
     /// @notice Get the current price per share.
     function pricePerShare() external view returns (uint256) {
+        return _currentPricePerShare();
+    }
+
+    function _currentPricePerShare() internal view returns (uint256) {
         if (totalShares == 0) return 1e18;
         return (totalDeposited * 1e18) / totalShares;
     }
