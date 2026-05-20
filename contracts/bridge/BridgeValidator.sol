@@ -15,6 +15,7 @@ contract BridgeValidator {
     address public owner;
     uint256 public totalWeight;
     uint256 public threshold;
+    uint256 public activeValidatorCount;
     address[] public validatorList;
     mapping(address => Validator) public validators;
 
@@ -28,11 +29,6 @@ contract BridgeValidator {
         _;
     }
 
-    modifier onlyValidator() {
-        require(validators[msg.sender].isActive, "BridgeValidator: not validator");
-        _;
-    }
-
     constructor(uint256 _threshold) {
         owner = msg.sender;
         threshold = _threshold;
@@ -41,10 +37,8 @@ contract BridgeValidator {
     /// @notice Add a new validator with a given weight.
     /// @param validator Address of the new validator.
     /// @param weight Voting weight assigned to the validator.
-    // BUG: Validators can add themselves — the onlyValidator modifier allows any
-    // existing validator to add new validators (including themselves again with
-    // more weight), bypassing owner governance over the validator set.
-    function addValidator(address validator, uint128 weight) external onlyValidator {
+    function addValidator(address validator, uint128 weight) external onlyOwner {
+        require(validator != address(0), "BridgeValidator: zero address");
         require(!validators[validator].isActive, "BridgeValidator: already active");
         require(weight > 0, "BridgeValidator: zero weight");
 
@@ -54,11 +48,8 @@ contract BridgeValidator {
             addedAt: block.timestamp
         });
 
-        // BUG: Weight overflow — totalWeight is uint256 but weight is uint128.
-        // However, repeated additions without removals can push totalWeight past
-        // the point where threshold checks become meaningless (totalWeight wraps
-        // or becomes so large that threshold ratio breaks).
         totalWeight += weight;
+        activeValidatorCount += 1;
         validatorList.push(validator);
 
         emit ValidatorAdded(validator, weight);
@@ -66,14 +57,14 @@ contract BridgeValidator {
 
     /// @notice Remove a validator from the active set.
     /// @param validator Address to remove.
-    // BUG: No minimum validator count check — validators can be removed until the
-    // set is empty, bricking the bridge since no one can sign transactions.
     function removeValidator(address validator) external onlyOwner {
         require(validators[validator].isActive, "BridgeValidator: not active");
+        require(activeValidatorCount > 3, "BridgeValidator: minimum validators");
 
         totalWeight -= validators[validator].weight;
         validators[validator].isActive = false;
         validators[validator].weight = 0;
+        activeValidatorCount -= 1;
 
         emit ValidatorRemoved(validator);
     }
@@ -124,10 +115,14 @@ contract BridgeValidator {
     /// @param weight Initial weight.
     function bootstrap(address validator, uint128 weight) external onlyOwner {
         require(validatorList.length == 0, "BridgeValidator: already bootstrapped");
+        require(validator != address(0), "BridgeValidator: zero address");
         require(weight > 0, "BridgeValidator: zero weight");
+
         validators[validator] = Validator({ isActive: true, weight: weight, addedAt: block.timestamp });
         totalWeight += weight;
+        activeValidatorCount = 1;
         validatorList.push(validator);
+
         emit ValidatorAdded(validator, weight);
     }
 }
