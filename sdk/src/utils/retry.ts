@@ -10,10 +10,13 @@ export interface RetryOptions {
 }
 
 const DEFAULT_OPTIONS: Required<Omit<RetryOptions, "onRetry">> = {
-  maxRetries: Infinity, // BUG: No cap — will retry forever by default
+  maxRetries: 5,
   baseDelayMs: 500,
-  maxDelayMs: 30_000,
+  maxDelayMs: 60_000,
 };
+const MAX_RETRIES_CAP = 50;
+const MAX_BACKOFF_MS = 60_000;
+const MAX_EXPONENT = 30;
 
 export class RetryHandler {
   private options: Required<Omit<RetryOptions, "onRetry">>;
@@ -21,8 +24,26 @@ export class RetryHandler {
   private consecutiveFailures = 0;
 
   constructor(options: RetryOptions = {}) {
-    this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.options = RetryHandler.normalizeOptions(options);
     this.onRetry = options.onRetry;
+  }
+
+  private static normalizeOptions(
+    options: RetryOptions
+  ): Required<Omit<RetryOptions, "onRetry">> {
+    const merged = { ...DEFAULT_OPTIONS, ...options };
+    const requestedRetries = Number.isFinite(merged.maxRetries)
+      ? Math.floor(merged.maxRetries)
+      : DEFAULT_OPTIONS.maxRetries;
+
+    return {
+      maxRetries: Math.min(Math.max(requestedRetries, 0), MAX_RETRIES_CAP),
+      baseDelayMs: Math.max(0, Math.floor(merged.baseDelayMs)),
+      maxDelayMs: Math.min(
+        Math.max(0, Math.floor(merged.maxDelayMs)),
+        MAX_BACKOFF_MS
+      ),
+    };
   }
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
@@ -31,8 +52,7 @@ export class RetryHandler {
     for (let attempt = 0; attempt <= this.options.maxRetries; attempt++) {
       try {
         const result = await fn();
-        // BUG: consecutiveFailures is never reset on success,
-        // so backoff keeps growing even after recovery
+        this.consecutiveFailures = 0;
         return result;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
@@ -50,11 +70,10 @@ export class RetryHandler {
   }
 
   private calculateBackoff(attempt: number): number {
-    // BUG: 2 ** attempt overflows to Infinity for large attempt values (attempt > ~1023),
-    // and Math.min with Infinity returns maxDelayMs, but intermediate calc can cause issues
-    const exponentialDelay = this.options.baseDelayMs * Math.pow(2, attempt);
+    const exponent = Math.min(Math.max(attempt, 0), MAX_EXPONENT);
+    const exponentialDelay = this.options.baseDelayMs * Math.pow(2, exponent);
     const jitter = Math.random() * this.options.baseDelayMs;
-    return Math.min(exponentialDelay + jitter, this.options.maxDelayMs);
+    return Math.min(exponentialDelay + jitter, this.options.maxDelayMs, MAX_BACKOFF_MS);
   }
 
   private sleep(ms: number): Promise<void> {
